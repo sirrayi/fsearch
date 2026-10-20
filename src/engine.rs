@@ -265,6 +265,12 @@ impl Engine {
         // As FSEvents reports it: real (a temp dir's /var is /private/var).
         let real = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
         let ours = real.as_os_str().as_bytes().to_vec();
+        // The churn folders are indexed but applied lazily (FSEARCH_NO_LAZY
+        // turns that off).
+        let lazy_dirs = walk::LazyDirs::build(opts.home.as_bytes(), std::env::var_os("FSEARCH_NO_LAZY").is_some_and(|v| v == "1"));
+        if lazy_dirs.used() {
+            let _ = walk::LAZY.set(lazy_dirs);
+        }
         let dir = opts.dir;
         let loading = Index::load(&dir.join("index.bin"));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -951,6 +957,10 @@ fn compact(shared: &Shared) {
     let idx = if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx };
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
+    // Rare enough to afford the lstats: forget cache dirs whose tag is gone.
+    if let Some(l) = walk::LAZY.get() {
+        l.prune();
+    }
     release_memory();
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
 }
@@ -1059,6 +1069,90 @@ impl Pace {
     }
 }
 
+/// A lazy unit's pending changes flush once quiet for this long, or once
+/// this old under churn that never quiets; past this many folders in one
+/// unit the unit is rescanned whole.
+const LAZY_QUIET: Duration = Duration::from_secs(5);
+const LAZY_MAX: Duration = Duration::from_secs(60);
+const LAZY_COLLAPSE: usize = 2048;
+
+/// A lazy unit's pending changes.
+#[derive(Default)]
+struct LazyPending {
+    /// Folders to relist, each with its recursive flag.
+    dirs: HashMap<Vec<u8>, bool>,
+    /// Too many folders pending: rescan the whole unit instead.
+    whole: bool,
+    /// When the unit's first pending event arrived (its Instant and wall
+    /// time), the latest's, and the lowest event id seen.
+    first: Option<(Instant, u32)>,
+    last: Option<Instant>,
+    min_id: u64,
+}
+
+/// Churn folders' pending changes, by lazy unit.
+#[derive(Default)]
+struct Lazy {
+    units: HashMap<Vec<u8>, LazyPending>,
+}
+
+impl Lazy {
+    fn add(&mut self, unit: &[u8], dir: Vec<u8>, recursive: bool, id: u64, now: Instant, wall: u32) {
+        let p = self.units.entry(unit.to_vec()).or_default();
+        p.first.get_or_insert((now, wall));
+        p.last = Some(now);
+        p.min_id = if p.min_id == 0 { id } else { p.min_id.min(id) };
+        if !p.whole {
+            *p.dirs.entry(dir).or_default() |= recursive;
+            if p.dirs.len() > LAZY_COLLAPSE {
+                p.whole = true;
+                p.dirs.clear();
+            }
+        }
+    }
+
+    /// (Folder, recursive) pairs due at `now`, draining their units.
+    fn due(&mut self, now: Instant) -> Vec<(Vec<u8>, bool)> {
+        let due = |p: &LazyPending| {
+            now.saturating_duration_since(p.last.unwrap()) >= LAZY_QUIET || now.saturating_duration_since(p.first.unwrap().0) >= LAZY_MAX
+        };
+        let mut out = Vec::new();
+        for (u, p) in self.units.iter().filter(|(_, p)| due(p)) {
+            if p.whole {
+                out.push((u.clone(), true));
+            } else {
+                out.extend(p.dirs.iter().map(|(d, &r)| (d.clone(), r)));
+            }
+        }
+        out.sort();
+        self.units.retain(|_, p| !due(p));
+        out
+    }
+
+    /// When the soonest unit is due, if any are pending.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        self.units
+            .values()
+            .map(|p| {
+                LAZY_QUIET
+                    .saturating_sub(now.saturating_duration_since(p.last.unwrap()))
+                    .min(LAZY_MAX.saturating_sub(now.saturating_duration_since(p.first.unwrap().0)))
+            })
+            .min()
+    }
+
+    /// Event ids from this one on are not all applied yet.
+    fn floor(&self) -> u64 {
+        self.units.values().map(|p| p.min_id).min().unwrap_or(u64::MAX)
+    }
+
+    /// The wall time of the oldest pending lazy event: `synced_at` caps
+    /// there rather than freezing while a unit churns on.
+    fn earliest_wall(&self) -> Option<u32> {
+        self.units.values().filter_map(|p| p.first).map(|(_, w)| w).min()
+    }
+}
+
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
@@ -1074,20 +1168,28 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let (mut pending, mut n_base) = (0usize, 0usize);
     // When the apply loop last received a non-empty event batch.
     let mut last_events = Instant::now();
+    // The highest event id ever seen: the watermark may rise to it once
+    // nothing is pending, even on wakes that applied nothing new.
+    let mut seen_max = 0u64;
     let mut pace = Pace::default();
+    // Churn folders' pending changes, batched by lazy unit.
+    let mut lazy = Lazy::default();
     loop {
         let mut wait = if gap.is_some() && relist_due.is_none() { Duration::from_millis(250) } else { Duration::from_secs(60) };
         if let Some(w) = pace.wait(Instant::now()) {
             wait = wait.min(w);
         }
         // Wake when the compaction quiet window closes while enough is
-        // pending, and when a deferred relist's cooldown ends (now, if it
-        // already has).
+        // pending, when a deferred relist's cooldown ends (now, if it
+        // already has), and when the earliest lazy unit is due.
         if pending > COMPACT_PENDING.max(n_base / 8) {
             wait = wait.min(COMPACT_QUIET.saturating_sub(last_events.elapsed()));
         }
         if relist_due.is_some() {
             wait = wait.min(relist_in(last_relist, Instant::now()).unwrap_or(Duration::ZERO));
+        }
+        if let Some(w) = lazy.wait(Instant::now()) {
+            wait = wait.min(w);
         }
         let mut events = match rx.recv_timeout(wait) {
             Ok(b) => b,
@@ -1102,8 +1204,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         if had_events {
             last_events = Instant::now();
         }
-        let (mut dirs, mut max_id): (HashMap<Vec<u8>, (bool, u64)>, u64) = (HashMap::new(), 0);
+        let mut dirs: HashMap<Vec<u8>, (bool, u64)> = HashMap::new();
         if had_events {
+            let (evt, wall) = (Instant::now(), crate::query::now_secs());
             let mut last_good = shared.live.read().unwrap().as_ref().map_or(0, |l| l.event_id);
             let current = shared.streams.load(Ordering::Relaxed);
             for e in events {
@@ -1122,7 +1225,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     }
                     root_flags |= e.flags;
                 }
-                max_id = max_id.max(e.id);
+                seen_max = seen_max.max(e.id);
                 if gap.is_none() {
                     last_good = last_good.max(e.id);
                 }
@@ -1134,13 +1237,22 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     }
                     continue;
                 }
-                let d = dirs.entry(crate::live::normalize(&e.path)).or_insert((false, e.id));
+                let d = crate::live::normalize(&e.path);
+                // A lazy folder's changes batch under its unit instead of
+                // listing now; Pace is for prompt paths only.
+                if let Some(u) = walk::LAZY.get().and_then(|l| l.unit(&d)) {
+                    let unit = d[..u].to_vec();
+                    lazy.add(&unit, d, e.flags & MUST_SCAN_SUBDIRS != 0, e.id, evt, wall);
+                    continue;
+                }
+                let d = dirs.entry(d).or_insert((false, e.id));
                 *d = (d.0 | (e.flags & MUST_SCAN_SUBDIRS != 0), d.1.min(e.id));
             }
         }
         let now = Instant::now();
         pace.sort(&mut dirs, now);
-        if !dirs.is_empty() {
+        let had_dirs = !dirs.is_empty();
+        if had_dirs {
             // The folders listed now (a held one is told when it is due).
             let hooks = shared.on_change.read().unwrap();
             if !hooks.is_empty() {
@@ -1172,16 +1284,52 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     }
                 }
                 // With a gap, everything is applied only up to its start;
-                // with folders held back, only up to their first event.
-                live.event_id = match gap {
-                    Some((from, _)) => live.event_id.min(from),
-                    None => live.event_id.max(max_id.min(pace.floor().saturating_sub(1))),
-                };
+                // with folders held back or lazy changes pending, only up
+                // to their first event.
+                live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
                 trees.append(&mut live.trees);
             }
             let (rec, flat): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, (r, _))| *r);
             trees.extend(rec.into_iter().map(|(p, _)| p));
             let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+        }
+        // A lazy unit flushes once quiet (or once too old): its folders go
+        // through the same fetch-under-read-lock, apply-under-write-lock
+        // path prompt ones do — minus Pace.
+        let due = lazy.due(now);
+        if !due.is_empty() {
+            let hooks = shared.on_change.read().unwrap();
+            if !hooks.is_empty() {
+                let changed: Vec<(&[u8], bool)> = due.iter().map(|(p, r)| (p.as_slice(), *r)).collect();
+                hooks.iter().for_each(|f| f(&changed));
+            }
+            drop(hooks);
+            let mut trees = Vec::new();
+            let fetched: Vec<_> = {
+                let g = shared.live.read().unwrap();
+                let live = g.as_ref().unwrap();
+                due.iter().map(|(p, r)| live.fetch(p, *r)).collect()
+            };
+            {
+                let mut g = shared.live.write().unwrap();
+                let live = g.as_mut().unwrap();
+                for f in fetched {
+                    if let Applied::Rebuild = live.apply(f) {
+                        rebuild = true;
+                    }
+                }
+                live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
+                trees.append(&mut live.trees);
+            }
+            let (rec, flat): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, r)| *r);
+            trees.extend(rec.into_iter().map(|(p, _)| p));
+            let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+        } else if !had_dirs {
+            // A wake that applied nothing — the floor may still have
+            // risen: the watermark catches up to what arrived.
+            let mut g = shared.live.write().unwrap();
+            let live = g.as_mut().unwrap();
+            live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
         }
         let replay = gap.filter(|(_, at)| at.elapsed() >= replay_delay(replays)).map(|(from, _)| from);
         if rebuild || (replay.is_some() && replays >= 3) && relist_due.is_none() {
@@ -1203,11 +1351,17 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         } else if let Some(from) = replay {
             log(format!("FSEvents dropped events before we read them: replaying from {from}"));
             shared.watch(from);
+            // Ids past `from` arrive again from the replay: the watermark
+            // mustn't run ahead of them on what was seen before the drop.
+            seen_max = from;
             (gap, replays) = (None, replays + 1);
         } else if had_events && gap.is_none() && pace.held.is_empty() && !shared.replaying.load(Ordering::Relaxed) {
             // Everything up to this batch is applied (a change's event can
-            // trail it by the stream latency; relisting keeps a margin).
-            shared.live.write().unwrap().as_mut().unwrap().synced_at = crate::query::now_secs();
+            // trail it by the stream latency; relisting keeps a margin) —
+            // except pending lazy changes, so cap at the oldest one's
+            // arrival rather than freezing while a unit churns on.
+            let wall = crate::query::now_secs();
+            shared.live.write().unwrap().as_mut().unwrap().synced_at = lazy.earliest_wall().map_or(wall, |w| wall.min(w));
         }
         if let Some(l) = shared.live.read().unwrap().as_ref() {
             l.names_cache.trim_if_idle(Duration::from_secs(60));
@@ -1237,6 +1391,12 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             last_save = Instant::now();
         }
     }
+}
+
+/// The watermark to stamp: never past an unflushed event (`floor`), never
+/// past a gap's start, and never backwards.
+fn advance(cur: u64, seen_max: u64, floor: u64, gap: Option<u64>) -> u64 {
+    gap.map_or(cur.max(seen_max.min(floor.saturating_sub(1))), |from| cur.min(from))
 }
 
 /// Whether to fold the overlay into the base now: always when asked; past
@@ -1341,5 +1501,46 @@ mod tests {
         assert_eq!(relist_in(Some(t), t), Some(RELIST_COOLDOWN));
         assert_eq!(relist_in(Some(t), t + Duration::from_secs(60)), Some(Duration::from_secs(240)));
         assert_eq!(relist_in(Some(t), t + RELIST_COOLDOWN), None);
+    }
+
+    /// The watermark: reaches seen_max once nothing is pending, stays
+    /// under a pending unit's floor and a gap's start, never backwards.
+    #[test]
+    fn advance_caps() {
+        assert_eq!(advance(5, 100, u64::MAX, None), 100);
+        // A pending lazy unit holds it under that unit's first event.
+        assert_eq!(advance(5, 100, 50, None), 49);
+        // A gap floors it at the gap's start; never backwards either way.
+        assert_eq!(advance(90, 30, u64::MAX, Some(40)), 40);
+        assert_eq!(advance(90, 30, u64::MAX, None), 90);
+        // floor of 0 (an id at 0) leaves no room to advance at all.
+        assert_eq!(advance(0, 100, 0, None), 0);
+    }
+
+    /// A lazy unit flushes once quiet or once too old, collapses past
+    /// LAZY_COLLAPSE folders, and keeps the loop's event floor honest.
+    #[test]
+    fn lazy_flushes() {
+        let t0 = Instant::now();
+        let mut l = Lazy::default();
+        l.add(b"/u", b"/u/a".to_vec(), false, 10, t0, 100);
+        l.add(b"/u", b"/u/b".to_vec(), true, 8, t0 + Duration::from_millis(50), 100);
+        l.add(b"/v", b"/v".to_vec(), false, 5, t0, 90);
+        assert_eq!(l.floor(), 5);
+        assert_eq!(l.earliest_wall(), Some(90));
+        assert!(l.due(t0 + Duration::from_secs(1)).is_empty());
+        // /v quieted; /u is still fresh.
+        assert_eq!(l.due(t0 + LAZY_QUIET), vec![(b"/v".to_vec(), false)]);
+        assert_eq!(l.floor(), 8);
+        // /u flushes once too old, quiet or not.
+        assert_eq!(l.due(t0 + LAZY_MAX), vec![(b"/u/a".to_vec(), false), (b"/u/b".to_vec(), true)]);
+        assert_eq!(l.floor(), u64::MAX);
+        assert!(l.earliest_wall().is_none());
+        // Past LAZY_COLLAPSE folders, the unit is rescanned whole.
+        let mut l = Lazy::default();
+        for i in 0..=LAZY_COLLAPSE {
+            l.add(b"/u", format!("/u/d{i}").into_bytes(), false, i as u64 + 1, t0, 100);
+        }
+        assert_eq!(l.due(t0 + LAZY_QUIET), vec![(b"/u".to_vec(), true)]);
     }
 }
