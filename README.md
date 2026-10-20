@@ -73,7 +73,9 @@ a file you name still reads it.
 Churn folders — caches, logs, build output, `node_modules`, folders with a
 `CACHEDIR.TAG` — are indexed like everything else, but their changes show
 up only once they quiet down (a few seconds; a minute at most under
-churn that never stops).
+churn that never stops). To have a folder truly skipped — its contents
+never indexed — list it in
+`~/Library/Application Support/FSearch/skip.txt`.
 
 ## Full Disk Access
 

@@ -250,21 +250,33 @@ impl Engine {
         // lock dies with the process.
         let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
         let owner = try_lock(&lock);
-        let skip: Vec<Vec<u8>> = match opts.skip {
+        let mut skip: Vec<Vec<u8>> = match opts.skip {
             // ("/a/" is /a; an empty entry would block everything.)
-            Some(v) => v.iter().map(|p| crate::live::normalize(p.as_os_str().as_bytes())).filter(|p| !p.is_empty()).collect(),
+            Some(ref v) => v.iter().map(|p| crate::live::normalize(p.as_os_str().as_bytes())).filter(|p| !p.is_empty()).collect(),
             None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
             None => {
                 log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
                 gated(&opts.home)
             }
         };
-        if !skip.is_empty() {
-            let _ = walk::SKIP.set(skip);
-        }
         // As FSEvents reports it: real (a temp dir's /var is /private/var).
         let real = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
         let ours = real.as_os_str().as_bytes().to_vec();
+        // skip.txt is the opt-in true-skip list, a path a line (~ allowed,
+        // # comments).
+        let mut txt_skip: Vec<Vec<u8>> = Vec::new();
+        for l in std::fs::read_to_string(opts.dir.join("skip.txt")).unwrap_or_default().lines() {
+            let l = l.trim();
+            if !l.is_empty() && !l.starts_with('#') {
+                txt_skip.push(walk::expand(l.as_bytes(), opts.home.as_bytes()));
+            }
+        }
+        if opts.skip.is_none() {
+            skip.extend(txt_skip.iter().cloned());
+        }
+        if !skip.is_empty() {
+            let _ = walk::SKIP.set(skip);
+        }
         // The churn folders are indexed but applied lazily (FSEARCH_NO_LAZY
         // turns that off).
         let lazy_dirs = walk::LazyDirs::build(opts.home.as_bytes(), std::env::var_os("FSEARCH_NO_LAZY").is_some_and(|v| v == "1"));
@@ -272,7 +284,19 @@ impl Engine {
             let _ = walk::LAZY.set(lazy_dirs);
         }
         let dir = opts.dir;
-        let loading = Index::load(&dir.join("index.bin"));
+        let index_path = dir.join("index.bin");
+        // The signature covers only the skip.txt folders: an index built
+        // under a different true-skip set is stale and is rebuilt instead
+        // (no file or an empty skip.txt is "no signature", so an upgrade
+        // with no config does not rebuild).
+        let sig = skip_sig(&txt_skip);
+        let loading = if owner && index_stale(&dir, &txt_skip) {
+            let _ = std::fs::remove_file(&index_path);
+            let _ = std::fs::write(dir.join(SKIP_SIG), sig.to_string());
+            None
+        } else {
+            Index::load(&index_path)
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
         let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
@@ -626,6 +650,32 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
 /// Next to index.bin: the folders it lacks for want of access, one per
 /// line (skipped, or refused by macOS).
 const SKIPPED: &str = "skipped";
+
+/// Next to index.bin: the skip-set signature the index was built with.
+const SKIP_SIG: &str = "skip.sig";
+
+fn saved_skip_sig(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(SKIP_SIG)).ok()?.trim().parse().ok()
+}
+
+/// Is the saved index stale under this skip.txt set? An empty one counts
+/// as "no signature", so an upgrade with no config never rebuilds.
+fn index_stale(dir: &Path, txt_skip: &[Vec<u8>]) -> bool {
+    !txt_skip.is_empty() && saved_skip_sig(dir) != Some(skip_sig(txt_skip))
+}
+
+/// What a set of skip.txt folders hashes to.
+fn skip_sig(paths: &[Vec<u8>]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut sorted = paths.to_vec();
+    sorted.sort();
+    for p in &sorted {
+        for &c in p.iter().chain([0xff].iter()) {
+            h = (h ^ c as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
 
 fn note_skipped(dir: &Path) {
     let denied = walk::DENIED.lock().unwrap();
@@ -1466,55 +1516,21 @@ mod tests {
         assert!(walk::blocked(b"/nonexistent-fsearch-skip/x") && !walk::blocked(b"/usr"));
     }
 
-    /// Compaction: always when asked, past the hard bound even mid-churn,
-    /// past the soft one only once quiet, and twice a day for unsaved
-    /// changes — also only once quiet.
+    /// A sig that isn't the saved one is stale, but only with a skip.txt
+    /// at all: an empty one hashes to "no sig" so an upgrade with no
+    /// config never rebuilds.
     #[test]
-    fn compact_decides() {
-        assert!(should_compact(0, 0, Duration::ZERO, None, true));
-        assert!(should_compact(COMPACT_HARD + 1, 0, Duration::ZERO, None, false));
-        assert!(!should_compact(COMPACT_PENDING + 1, 0, Duration::ZERO, None, false));
-        assert!(should_compact(COMPACT_PENDING + 1, 0, COMPACT_QUIET, None, false));
-        // Both bounds grow with the base: under soft for a 1M-entry index
-        // even when quiet, and over the old hard bound but under the grown
-        // one for a 2M-entry index while churn goes on.
-        assert!(!should_compact(COMPACT_PENDING + 1, 1_000_000, COMPACT_QUIET, None, false));
-        assert!(!should_compact(COMPACT_HARD + 1, 2_000_000, Duration::ZERO, None, false));
-        assert!(should_compact(1_000_001, 2_000_000, Duration::ZERO, None, false));
-        assert!(should_compact(1, 0, COMPACT_QUIET, Some(COMPACT_EVERY), false));
-        assert!(!should_compact(1, 0, COMPACT_QUIET, Some(Duration::from_secs(60)), false));
-        assert!(!should_compact(1, 0, Duration::ZERO, Some(COMPACT_EVERY), false));
-        assert!(!should_compact(1, 0, COMPACT_QUIET, None, false));
-    }
-
-    /// Replay backoff doubles and caps; a relist inside its cooldown tells
-    /// the caller how long is left.
-    #[test]
-    fn backoff_and_cooldown() {
-        assert_eq!(replay_delay(0), Duration::from_secs(2));
-        assert_eq!(replay_delay(1), Duration::from_secs(4));
-        assert_eq!(replay_delay(3), Duration::from_secs(16));
-        assert_eq!(replay_delay(5), REPLAY_MAX);
-        assert_eq!(replay_delay(9), REPLAY_MAX);
-        let t = Instant::now();
-        assert!(relist_in(None, t).is_none());
-        assert_eq!(relist_in(Some(t), t), Some(RELIST_COOLDOWN));
-        assert_eq!(relist_in(Some(t), t + Duration::from_secs(60)), Some(Duration::from_secs(240)));
-        assert_eq!(relist_in(Some(t), t + RELIST_COOLDOWN), None);
-    }
-
-    /// The watermark: reaches seen_max once nothing is pending, stays
-    /// under a pending unit's floor and a gap's start, never backwards.
-    #[test]
-    fn advance_caps() {
-        assert_eq!(advance(5, 100, u64::MAX, None), 100);
-        // A pending lazy unit holds it under that unit's first event.
-        assert_eq!(advance(5, 100, 50, None), 49);
-        // A gap floors it at the gap's start; never backwards either way.
-        assert_eq!(advance(90, 30, u64::MAX, Some(40)), 40);
-        assert_eq!(advance(90, 30, u64::MAX, None), 90);
-        // floor of 0 (an id at 0) leaves no room to advance at all.
-        assert_eq!(advance(0, 100, 0, None), 0);
+    fn skip_sig_change_is_stale() {
+        let d = std::env::temp_dir().join(format!("fsearch-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!index_stale(&d, &[]));
+        assert!(index_stale(&d, &[b"/a".to_vec()]));
+        std::fs::write(d.join(SKIP_SIG), skip_sig(&[b"/a".to_vec()]).to_string()).unwrap();
+        assert!(!index_stale(&d, &[b"/a".to_vec()]));
+        assert!(index_stale(&d, &[b"/b".to_vec()]));
+        assert!(!index_stale(&d, &[]));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A lazy unit flushes once quiet or once too old, collapses past
@@ -1542,5 +1558,56 @@ mod tests {
             l.add(b"/u", format!("/u/d{i}").into_bytes(), false, i as u64 + 1, t0, 100);
         }
         assert_eq!(l.due(t0 + LAZY_QUIET), vec![(b"/u".to_vec(), true)]);
+    }
+
+    /// Compaction: always when asked, past the hard bound even mid-churn,
+    /// past the soft one only once quiet, and twice a day for unsaved
+    /// changes — also only once quiet.
+    #[test]
+    fn compact_decides() {
+        assert!(should_compact(0, 0, Duration::ZERO, None, true));
+        assert!(should_compact(COMPACT_HARD + 1, 0, Duration::ZERO, None, false));
+        assert!(!should_compact(COMPACT_PENDING + 1, 0, Duration::ZERO, None, false));
+        assert!(should_compact(COMPACT_PENDING + 1, 0, COMPACT_QUIET, None, false));
+        // Both bounds grow with the base: under soft for a 1M-entry index
+        // even when quiet, and over the old hard bound but under the grown
+        // one for a 2M-entry index while churn goes on.
+        assert!(!should_compact(COMPACT_PENDING + 1, 1_000_000, COMPACT_QUIET, None, false));
+        assert!(!should_compact(COMPACT_HARD + 1, 2_000_000, Duration::ZERO, None, false));
+        assert!(should_compact(1_000_001, 2_000_000, Duration::ZERO, None, false));
+        assert!(should_compact(1, 0, COMPACT_QUIET, Some(COMPACT_EVERY), false));
+        assert!(!should_compact(1, 0, COMPACT_QUIET, Some(Duration::from_secs(60)), false));
+        assert!(!should_compact(1, 0, Duration::ZERO, Some(COMPACT_EVERY), false));
+        assert!(!should_compact(1, 0, COMPACT_QUIET, None, false));
+    }
+
+    /// The watermark: reaches seen_max once nothing is pending, stays
+    /// under a pending unit's floor and a gap's start, never backwards.
+    #[test]
+    fn advance_caps() {
+        assert_eq!(advance(5, 100, u64::MAX, None), 100);
+        // A pending lazy unit holds it under that unit's first event.
+        assert_eq!(advance(5, 100, 50, None), 49);
+        // A gap floors it at the gap's start; never backwards either way.
+        assert_eq!(advance(90, 30, u64::MAX, Some(40)), 40);
+        assert_eq!(advance(90, 30, u64::MAX, None), 90);
+        // floor of 0 (an id at 0) leaves no room to advance at all.
+        assert_eq!(advance(0, 100, 0, None), 0);
+    }
+
+    /// Replay backoff doubles and caps; a relist inside its cooldown tells
+    /// the caller how long is left.
+    #[test]
+    fn backoff_and_cooldown() {
+        assert_eq!(replay_delay(0), Duration::from_secs(2));
+        assert_eq!(replay_delay(1), Duration::from_secs(4));
+        assert_eq!(replay_delay(3), Duration::from_secs(16));
+        assert_eq!(replay_delay(5), REPLAY_MAX);
+        assert_eq!(replay_delay(9), REPLAY_MAX);
+        let t = Instant::now();
+        assert!(relist_in(None, t).is_none());
+        assert_eq!(relist_in(Some(t), t), Some(RELIST_COOLDOWN));
+        assert_eq!(relist_in(Some(t), t + Duration::from_secs(60)), Some(Duration::from_secs(240)));
+        assert_eq!(relist_in(Some(t), t + RELIST_COOLDOWN), None);
     }
 }
