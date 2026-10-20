@@ -122,6 +122,9 @@ struct Shared {
     /// and the event id it started from.
     streams: std::sync::atomic::AtomicU32,
     since: AtomicU64,
+    /// The data dir as FSEvents reports it (canonicalized): events under it
+    /// always pass the skip filter, a follower sees its owner's writes.
+    ours: Vec<u8>,
     /// The stream is still replaying history (until HISTORY_DONE).
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
@@ -259,6 +262,9 @@ impl Engine {
         if !skip.is_empty() {
             let _ = walk::SKIP.set(skip);
         }
+        // As FSEvents reports it: real (a temp dir's /var is /private/var).
+        let real = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
+        let ours = real.as_os_str().as_bytes().to_vec();
         let dir = opts.dir;
         let loading = Index::load(&dir.join("index.bin"));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -282,6 +288,7 @@ impl Engine {
             stream: Mutex::new(None),
             streams: Default::default(),
             since: AtomicU64::new(0),
+            ours,
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
             early: Mutex::new(Vec::new()),
@@ -557,10 +564,11 @@ impl Shared {
         self.replaying.store(true, Ordering::Relaxed);
         self.since.store(since, Ordering::Relaxed);
         let n = self.streams.fetch_add(1, Ordering::Relaxed) + 1;
-        // 10 ms: a change shows in ~12 ms (fseventsd's own delay); at 0.1 s,
-        // one made within 0.1 s of another (save then rename) took ~100 ms.
-        // `Pace` keeps a busy folder from being listed that often.
-        let new = fsevents::watch(since, 0.01, self.wake.clone(), n);
+        // 0.5 s of latency lets fseventsd batch a burst of churn into one
+        // wakeup instead of one per write (an isolated change still arrives
+        // at once: the stream keeps NO_DEFER). `Pace` keeps a busy folder
+        // from being listed that often anyway.
+        let new = fsevents::watch(since, self.wake.clone(), n, &self.ours);
         *self.stream.lock().unwrap() = Some(new);
     }
 
@@ -660,7 +668,7 @@ fn rescan_unskipped(shared: &Shared) {
 }
 
 /// Is `path` `dir` or inside it?
-fn under(path: &[u8], dir: &[u8]) -> bool {
+pub(crate) fn under(path: &[u8], dir: &[u8]) -> bool {
     path.starts_with(dir) && (path.len() == dir.len() || path[dir.len()] == b'/')
 }
 
@@ -1054,9 +1062,7 @@ impl Pace {
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
-    // As FSEvents reports it: real (a temp dir's /var is /private/var).
-    let real = shared.dir.canonicalize().unwrap_or_else(|_| shared.dir.clone());
-    let ours = real.as_os_str().as_bytes();
+    let ours = shared.ours.as_slice();
     // Events fseventsd dropped before we read them: (replay from, last drop).
     let mut gap: Option<(u64, Instant)> = None;
     // Replays in a row that dropped again; the third falls back to a relist.
