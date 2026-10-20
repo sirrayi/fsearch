@@ -34,8 +34,14 @@ const FOLLOW_EVERY: Duration = Duration::from_secs(10);
 /// Seconds before the last known-good moment that a relist also covers.
 const SYNC_MARGIN: u32 = 120;
 /// How long FSEvents must go without dropping events before the gap is
-/// replayed: restarting mid-burst only drops more.
+/// replayed: restarting mid-burst only drops more. Each failed replay
+/// doubles the wait, capped, so a saturated fseventsd isn't reasked hard.
 const REPLAY_QUIET: Duration = Duration::from_secs(2);
+const REPLAY_MAX: Duration = Duration::from_secs(60);
+/// Under sustained churn a relist is itself seconds of listing that
+/// immediately loses track again: at most one per this long; a due one
+/// inside the window waits it out.
+const RELIST_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub struct Options {
     /// Where the index lives (`index.bin`, `content/`).
@@ -1055,20 +1061,27 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut gap: Option<(u64, Instant)> = None;
     // Replays in a row that dropped again; the third falls back to a relist.
     let mut replays = 0;
+    // A relist due inside RELIST_COOLDOWN, as (why, root flags).
+    let mut relist_due: Option<(&'static str, u32)> = None;
+    let mut last_relist: Option<Instant> = None;
     // The last batch's pending count and base size, for the wait below.
     let (mut pending, mut n_base) = (0usize, 0usize);
     // When the apply loop last received a non-empty event batch.
     let mut last_events = Instant::now();
     let mut pace = Pace::default();
     loop {
-        let mut wait = if gap.is_some() { Duration::from_millis(250) } else { Duration::from_secs(60) };
+        let mut wait = if gap.is_some() && relist_due.is_none() { Duration::from_millis(250) } else { Duration::from_secs(60) };
         if let Some(w) = pace.wait(Instant::now()) {
             wait = wait.min(w);
         }
         // Wake when the compaction quiet window closes while enough is
-        // pending.
+        // pending, and when a deferred relist's cooldown ends (now, if it
+        // already has).
         if pending > COMPACT_PENDING.max(n_base / 8) {
             wait = wait.min(COMPACT_QUIET.saturating_sub(last_events.elapsed()));
+        }
+        if relist_due.is_some() {
+            wait = wait.min(relist_in(last_relist, Instant::now()).unwrap_or(Duration::ZERO));
         }
         let mut events = match rx.recv_timeout(wait) {
             Ok(b) => b,
@@ -1164,15 +1177,23 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             trees.extend(rec.into_iter().map(|(p, _)| p));
             let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
         }
-        let replay = gap.filter(|(_, at)| at.elapsed() >= REPLAY_QUIET).map(|(from, _)| from);
-        if rebuild || (replay.is_some() && replays >= 3) {
+        let replay = gap.filter(|(_, at)| at.elapsed() >= replay_delay(replays)).map(|(from, _)| from);
+        if rebuild || (replay.is_some() && replays >= 3) && relist_due.is_none() {
             let why = match root_flags {
                 f if f & KERNEL_DROPPED != 0 => "kernel dropped events",
                 0 => "events dropped again while replaying",
                 _ => "history unavailable",
             };
-            relist_changed(shared, why, root_flags);
-            (gap, replays) = (None, 0);
+            // A relist due inside the cooldown waits it out: the gap stays
+            // (events before it are not all applied), and one relist runs
+            // when the window ends instead of a relist per burst.
+            relist_due = Some((why, root_flags));
+        }
+        if let Some((why, flags)) = relist_due {
+            if relist_in(last_relist, Instant::now()).is_none() {
+                relist_changed(shared, why, flags);
+                (gap, replays, relist_due, last_relist) = (None, 0, None, Some(Instant::now()));
+            }
         } else if let Some(from) = replay {
             log(format!("FSEvents dropped events before we read them: replaying from {from}"));
             shared.watch(from);
@@ -1224,6 +1245,18 @@ fn should_compact(pending: usize, n_base: usize, quiet_for: Duration, stale_for:
         || pending > hard
         || (pending > soft && quiet_for >= COMPACT_QUIET)
         || (stale_for.is_some_and(|s| s >= COMPACT_EVERY) && quiet_for >= COMPACT_QUIET)
+}
+
+/// How long a replay after `replays` failed ones waits for quiet first,
+/// doubling each time (2, 4, 8, ... capped at a minute).
+fn replay_delay(replays: u32) -> Duration {
+    REPLAY_QUIET.saturating_mul(1 << replays.min(5)).min(REPLAY_MAX)
+}
+
+/// How long until a relist may run again; None: it may now.
+fn relist_in(last: Option<Instant>, now: Instant) -> Option<Duration> {
+    let left = RELIST_COOLDOWN.saturating_sub(now.saturating_duration_since(last?));
+    (left > Duration::ZERO).then_some(left)
 }
 
 /// Default data dir: `~/Library/Application Support/FSearch`.
@@ -1286,5 +1319,21 @@ mod tests {
         assert!(!should_compact(1, 0, COMPACT_QUIET, Some(Duration::from_secs(60)), false));
         assert!(!should_compact(1, 0, Duration::ZERO, Some(COMPACT_EVERY), false));
         assert!(!should_compact(1, 0, COMPACT_QUIET, None, false));
+    }
+
+    /// Replay backoff doubles and caps; a relist inside its cooldown tells
+    /// the caller how long is left.
+    #[test]
+    fn backoff_and_cooldown() {
+        assert_eq!(replay_delay(0), Duration::from_secs(2));
+        assert_eq!(replay_delay(1), Duration::from_secs(4));
+        assert_eq!(replay_delay(3), Duration::from_secs(16));
+        assert_eq!(replay_delay(5), REPLAY_MAX);
+        assert_eq!(replay_delay(9), REPLAY_MAX);
+        let t = Instant::now();
+        assert!(relist_in(None, t).is_none());
+        assert_eq!(relist_in(Some(t), t), Some(RELIST_COOLDOWN));
+        assert_eq!(relist_in(Some(t), t + Duration::from_secs(60)), Some(Duration::from_secs(240)));
+        assert_eq!(relist_in(Some(t), t + RELIST_COOLDOWN), None);
     }
 }
