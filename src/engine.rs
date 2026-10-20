@@ -18,9 +18,13 @@ use std::time::{Duration, Instant};
 
 // Every search scans the whole overlay (~1 ms per 100k entries), and a
 // follower starting up replays everything since the save, so fold it into
-// the base once it grows: ~1 s of CPU and a ~280 MB write, about hourly on a
-// busy disk. Otherwise only twice a day; restart replays FSEvents anyway.
+// the base once it grows — and grows with the base: a big index tolerates a
+// bigger overlay. Below the soft bound compaction waits for the disk to go
+// quiet; past the hard one it runs anyway. Otherwise only twice a day;
+// restart replays FSEvents anyway.
 const COMPACT_PENDING: usize = 50_000;
+const COMPACT_HARD: usize = 500_000;
+const COMPACT_QUIET: Duration = Duration::from_secs(30);
 const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
 const CONTENT_QUIET: Duration = Duration::from_secs(2);
@@ -1051,10 +1055,21 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut gap: Option<(u64, Instant)> = None;
     // Replays in a row that dropped again; the third falls back to a relist.
     let mut replays = 0;
+    // The last batch's pending count and base size, for the wait below.
+    let (mut pending, mut n_base) = (0usize, 0usize);
+    // When the apply loop last received a non-empty event batch.
+    let mut last_events = Instant::now();
     let mut pace = Pace::default();
     loop {
-        let wait = if gap.is_some() { Duration::from_millis(250) } else { Duration::from_secs(60) };
-        let wait = pace.wait(Instant::now()).map_or(wait, |w| w.min(wait));
+        let mut wait = if gap.is_some() { Duration::from_millis(250) } else { Duration::from_secs(60) };
+        if let Some(w) = pace.wait(Instant::now()) {
+            wait = wait.min(w);
+        }
+        // Wake when the compaction quiet window closes while enough is
+        // pending.
+        if pending > COMPACT_PENDING.max(n_base / 8) {
+            wait = wait.min(COMPACT_QUIET.saturating_sub(last_events.elapsed()));
+        }
         let mut events = match rx.recv_timeout(wait) {
             Ok(b) => b,
             Err(RecvTimeoutError::Timeout) => Vec::new(),
@@ -1065,6 +1080,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| under(&e.path, ours));
         let (mut rebuild, mut root_flags, had_events) = (false, 0, !events.is_empty());
+        if had_events {
+            last_events = Instant::now();
+        }
         let (mut dirs, mut max_id): (HashMap<Vec<u8>, (bool, u64)>, u64) = (HashMap::new(), 0);
         if had_events {
             let mut last_good = shared.live.read().unwrap().as_ref().map_or(0, |l| l.event_id);
@@ -1179,17 +1197,33 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         if !shared.owner() {
             continue;
         }
-        let (pending, stale) = {
+        let stale;
+        {
             let g = shared.live.read().unwrap();
             let live = g.as_ref().unwrap();
-            (live.over.len() + live.dead_count, live.event_id != live.base.event_id)
+            (pending, n_base) = (live.over.len() + live.dead_count, live.base.n);
+            stale = live.event_id != live.base.event_id;
         };
         let asked = shared.save_requested.swap(false, Ordering::Relaxed);
-        if asked || pending > COMPACT_PENDING || (stale && last_save.elapsed() > COMPACT_EVERY) {
+        if should_compact(pending, n_base, last_events.elapsed(), stale.then(|| last_save.elapsed()), asked) {
             compact(shared);
             last_save = Instant::now();
         }
     }
+}
+
+/// Whether to fold the overlay into the base now: always when asked; past
+/// the hard bound even mid-churn; past the soft one once the disk has been
+/// quiet for COMPACT_QUIET; or with unsaved changes twice a day, again once
+/// quiet. (`stale_for`: how long the last save is, when changes are
+/// unsaved.)
+fn should_compact(pending: usize, n_base: usize, quiet_for: Duration, stale_for: Option<Duration>, asked: bool) -> bool {
+    let soft = COMPACT_PENDING.max(n_base / 8);
+    let hard = COMPACT_HARD.max(n_base / 2);
+    asked
+        || pending > hard
+        || (pending > soft && quiet_for >= COMPACT_QUIET)
+        || (stale_for.is_some_and(|s| s >= COMPACT_EVERY) && quiet_for >= COMPACT_QUIET)
 }
 
 /// Default data dir: `~/Library/Application Support/FSearch`.
@@ -1231,5 +1265,26 @@ mod tests {
     fn skip_entries() {
         follower("skip", "/h");
         assert!(walk::blocked(b"/nonexistent-fsearch-skip/x") && !walk::blocked(b"/usr"));
+    }
+
+    /// Compaction: always when asked, past the hard bound even mid-churn,
+    /// past the soft one only once quiet, and twice a day for unsaved
+    /// changes — also only once quiet.
+    #[test]
+    fn compact_decides() {
+        assert!(should_compact(0, 0, Duration::ZERO, None, true));
+        assert!(should_compact(COMPACT_HARD + 1, 0, Duration::ZERO, None, false));
+        assert!(!should_compact(COMPACT_PENDING + 1, 0, Duration::ZERO, None, false));
+        assert!(should_compact(COMPACT_PENDING + 1, 0, COMPACT_QUIET, None, false));
+        // Both bounds grow with the base: under soft for a 1M-entry index
+        // even when quiet, and over the old hard bound but under the grown
+        // one for a 2M-entry index while churn goes on.
+        assert!(!should_compact(COMPACT_PENDING + 1, 1_000_000, COMPACT_QUIET, None, false));
+        assert!(!should_compact(COMPACT_HARD + 1, 2_000_000, Duration::ZERO, None, false));
+        assert!(should_compact(1_000_001, 2_000_000, Duration::ZERO, None, false));
+        assert!(should_compact(1, 0, COMPACT_QUIET, Some(COMPACT_EVERY), false));
+        assert!(!should_compact(1, 0, COMPACT_QUIET, Some(Duration::from_secs(60)), false));
+        assert!(!should_compact(1, 0, Duration::ZERO, Some(COMPACT_EVERY), false));
+        assert!(!should_compact(1, 0, COMPACT_QUIET, None, false));
     }
 }
