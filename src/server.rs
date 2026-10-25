@@ -51,9 +51,23 @@ pub fn serve(dir: PathBuf, home: String) {
             return;
         }
     };
-    for conn in listener.incoming().flatten() {
-        let cx = cx.clone();
-        std::thread::spawn(move || handle(conn, &cx));
+    // A persistent accept error (out of fds, say) must not spin at 100%
+    // CPU: back off, and log it at most once per 10 s per error kind.
+    let mut last: Option<(std::io::ErrorKind, Instant)> = None;
+    for conn in listener.incoming() {
+        match conn {
+            Ok(conn) => {
+                let cx = cx.clone();
+                std::thread::spawn(move || handle(conn, &cx));
+            }
+            Err(e) => {
+                if last.is_none_or(|(k, t)| k != e.kind() || t.elapsed() >= Duration::from_secs(10)) {
+                    eprintln!("{} accept: {e}", fsearch::query::now_secs());
+                    last = Some((e.kind(), Instant::now()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
