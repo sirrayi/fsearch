@@ -7,7 +7,7 @@ use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_OTHER};
 use fsearch::{Engine, Found, GrepMode, Options, Query};
 use regex::bytes::Regex;
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -112,18 +112,44 @@ pub fn stop(dir: &Path) -> Result<(), String> {
 /// still connected (typing): most gaps between keystrokes are shorter.
 const WARM: Duration = Duration::from_millis(250);
 
+/// The most bytes one request line may take: `lines()` would grow an
+/// endless line without bound.
+const MAX_LINE: usize = 16 << 20;
+
 fn handle(mut conn: UnixStream, cx: &Ctx) {
     // Content searches run on this thread: keep them on performance cores.
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
     let Ok(r) = conn.try_clone() else { return };
+    let mut reader = BufReader::new(r);
+    let mut buf = Vec::new();
     let mut out = Vec::new();
-    for line in BufReader::new(r).lines() {
-        let Ok(line) = line else { return };
-        if line.trim().is_empty() {
+    loop {
+        buf.clear();
+        let n = match (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n == 0 {
+            return;
+        }
+        if buf.len() > MAX_LINE && buf.last() != Some(&b'\n') {
+            let _ = conn.write_all(b"{\"ok\":false,\"error\":\"request too long\"}\n");
+            return;
+        }
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
         out.clear();
-        respond(&line, cx, &mut out);
+        match std::str::from_utf8(&buf) {
+            Ok(line) => respond(line, cx, &mut out),
+            Err(_) => put(&mut out, &json!({"ok": false, "error": "bad json: not UTF-8"})),
+        }
         if conn.write_all(&out).is_err() {
             return;
         }
