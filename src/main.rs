@@ -14,7 +14,7 @@ use std::time::Instant;
 static GLOBAL: fsearch::alloc::Alloc = fsearch::alloc::Alloc;
 
 const USAGE: &str = "usage:
-  fsearch <query...> [--json]   search (starts the daemon if needed)
+  fsearch [--json] [--] <query...>  search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
   fsearch mcp                   MCP server on stdin/stdout, for coding agents
   fsearch serve                 run the daemon in the foreground
@@ -58,9 +58,17 @@ fn main() {
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
-        Some(_) => {
-            let json = args.iter().any(|a| a == "--json");
-            let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
+        Some("--") | Some(_) => {
+            // `--` ends the options: everything after it is the query,
+            // verbatim (`fsearch -- status` finds a file named status).
+            let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+            let json = args[..at].iter().any(|a| a == "--json");
+            let q: Vec<&str> = args[..at]
+                .iter()
+                .map(String::as_str)
+                .filter(|a| *a != "--json")
+                .chain(args[(at + 1).min(args.len())..].iter().map(String::as_str))
+                .collect();
             // The folder `git:` filters and globs are about, unless `in:` says.
             let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
             print_one(&serde_json::json!({"q": q.join(" "), "cwd": cwd}), json);
