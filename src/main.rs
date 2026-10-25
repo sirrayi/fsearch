@@ -86,13 +86,20 @@ fn space_efficient() {
 
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    s.write_all(format!("{req}\n").as_bytes()).unwrap();
+    s.write_all(format!("{req}\n").as_bytes()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     // One request only: the daemon needn't keep the cores warm for a next one.
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).unwrap();
+    BufReader::new(&s).read_line(&mut line).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
+    if line.is_empty() {
+        die(&format!("the daemon closed the connection without answering; see {}/daemon.log", data_dir().display()));
+    }
     if raw {
         print!("{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if v["ok"] != true {
+            std::process::exit(1);
+        }
         return;
     }
     let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
@@ -113,7 +120,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
 
 fn stdio() {
     let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    let mut up = s.try_clone().unwrap();
+    let mut up = s.try_clone().unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
