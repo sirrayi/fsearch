@@ -252,9 +252,9 @@ fn install(login: bool) {
 </dict>
 </plist>
 "#,
-        bin.display(),
-        log.display(),
-        log.display()
+        xml_escape(&bin.display().to_string()),
+        xml_escape(&log.display().to_string()),
+        xml_escape(&log.display().to_string())
     );
     std::fs::write(plist_path(), plist).unwrap();
     // bootout returns before the old job is fully gone; bootstrap fails
@@ -270,6 +270,11 @@ fn install(login: bool) {
     println!("installed {} (LaunchAgent {LABEL})\n{agents}", bin.display());
 }
 
+/// A string safe inside a plist's XML.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+}
+
 fn uninstall() {
     launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
     let _ = std::fs::remove_file(plist_path());
@@ -279,4 +284,14 @@ fn uninstall() {
 fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml() {
+        assert_eq!(xml_escape("/a&b/c<'d'>\"e\""), "/a&amp;b/c&lt;&apos;d&apos;&gt;&quot;e&quot;");
+    }
 }
