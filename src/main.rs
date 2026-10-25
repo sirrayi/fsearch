@@ -225,12 +225,17 @@ fn install(login: bool) {
     let target = format!("{}/{LABEL}", domain());
     launchctl(&["bootout", &target]);
     server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
-    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    let bindir = bin.parent().unwrap();
+    std::fs::create_dir_all(bindir).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", bindir.display())));
     // Replace, never overwrite in place: a rewritten signed binary at the same
     // path can be SIGKILLed by the code-signing cache. Copy then rename, so
     // reinstalling from the installed copy works too.
     let tmp = bin.with_extension("new");
-    std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
+    if let Err(e) = std::fs::copy(&exe, &tmp).and_then(|_| std::fs::rename(&tmp, &bin)) {
+        let _ = std::fs::remove_file(&tmp);
+        die(&format!("copy: {e}"));
+    }
     let agents =
         format!("for coding agents: claude mcp add -s user fsearch -- {0} mcp\n                   codex mcp add fsearch -- {0} mcp", bin.display());
     if !login {
@@ -256,10 +261,14 @@ fn install(login: bool) {
         xml_escape(&log.display().to_string()),
         xml_escape(&log.display().to_string())
     );
-    std::fs::write(plist_path(), plist).unwrap();
+    let path = plist_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", dir.display())));
+    }
+    std::fs::write(&path, plist).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
     // bootout returns before the old job is fully gone; bootstrap fails
     // until it is.
-    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+    let bootstrap = || launchctl(&["bootstrap", &domain(), path.to_str().unwrap()]);
     let retry = || {
         std::thread::sleep(std::time::Duration::from_millis(100));
         false
