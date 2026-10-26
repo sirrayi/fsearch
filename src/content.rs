@@ -1478,15 +1478,18 @@ fn skip_list(home: &[u8]) -> Vec<Vec<u8>> {
     let text = path.and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
     (text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii))
         .filter(|l| !l.is_empty() && !l.starts_with(b"#"))
-        .map(|l| {
-            let l = l.strip_suffix(b"/").unwrap_or(l);
-            match l.strip_prefix(b"~") {
-                Some(rest) => [home, rest].concat(),
-                None if l.starts_with(b"/") => l.to_vec(),
-                None => join(home, l),
-            }
-        })
+        .map(|l| skip_line(home, l.strip_suffix(b"/").unwrap_or(l)))
         .collect()
+}
+
+/// One skip-list line as an absolute path. `~` is home only as "~" or
+/// "~/...": "~bob" is a literal name, relative like other relative lines.
+fn skip_line(home: &[u8], l: &[u8]) -> Vec<u8> {
+    match l.strip_prefix(b"~").filter(|r| r.is_empty() || r.starts_with(b"/")) {
+        Some(rest) => [home, rest].concat(),
+        None if l.starts_with(b"/") => l.to_vec(),
+        None => join(home, l),
+    }
 }
 
 /// Ignore files parsed so far, by path, with the (size, mtime) they were
@@ -4855,6 +4858,16 @@ mod tests {
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// `~` in the skip list is home only as "~" or "~/...".
+    #[test]
+    fn skip_line_tilde() {
+        assert_eq!(skip_line(b"/h", b"~/a"), b"/h/a");
+        assert_eq!(skip_line(b"/h", b"~"), b"/h");
+        assert_eq!(skip_line(b"/h", b"~bob"), b"/h/~bob");
+        assert_eq!(skip_line(b"/h", b"rel"), b"/h/rel");
+        assert_eq!(skip_line(b"/h", b"/abs"), b"/abs");
     }
 
     /// A shown line is cut at a character, not inside one.

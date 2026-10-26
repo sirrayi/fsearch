@@ -594,7 +594,8 @@ impl Query {
                 })
             }
             "in" => {
-                let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
+                // `~` is home only as "~" or "~/..."; "~bob" is a name.
+                let p = v.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')).map_or(v.to_string(), |r| format!("{home}{r}"));
                 self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
             }
             "size" => self.size = range(v, parse_size)?,
@@ -4080,6 +4081,14 @@ mod tests {
     fn mtime_older_than_u32() {
         let q = Query::parse("mtime:>140y", "/h").unwrap();
         assert_eq!(q.mtime, (0, 0));
+    }
+
+    /// `in:~` and `in:~/x` scope to home; `in:~bob` is a literal name.
+    #[test]
+    fn tilde_scope() {
+        assert_eq!(Query::parse("in:~/x", "/h").unwrap().scope.as_deref(), Some(&b"/h/x"[..]));
+        assert_eq!(Query::parse("in:~", "/h").unwrap().scope.as_deref(), Some(&b"/h"[..]));
+        assert_eq!(Query::parse("in:~bob", "/h").unwrap().scope.as_deref(), Some(&b"~bob"[..]));
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.
