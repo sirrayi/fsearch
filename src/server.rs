@@ -354,7 +354,13 @@ impl Extras {
             Some(_) => return Err("glob must be a string or a list of them".into()),
         };
         if glob_op {
-            globs.insert(0, v.get("pattern").and_then(Value::as_str).ok_or("glob needs a pattern")?);
+            // The pattern is `pattern`, else `glob` itself: {"op": "glob",
+            // "glob": "*.rs"} lists .rs files, not "glob needs a pattern".
+            match v.get("pattern").and_then(Value::as_str) {
+                Some(p) => globs.insert(0, p),
+                None if globs.iter().any(|g| !g.starts_with('!')) => {}
+                None => return Err("glob needs a pattern".into()),
+            }
             q.kind = q.kind.or(Some(KIND_FILE));
         }
         // `git:` filters are about one repo: without `in:`, the one holding `cwd`.
@@ -956,6 +962,21 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The glob op's pattern is `pattern`, else a positive `glob`.
+    #[test]
+    fn glob_op_pattern() {
+        let parse = |v: Value| {
+            let mut q = Query::default();
+            Extras::parse(&v, &mut q, Vec::new(), true, false).map(|_| q.path_re.map(|r| r.as_str().to_string()))
+        };
+        let by_pattern = parse(json!({"op": "glob", "pattern": "*.rs"})).unwrap();
+        assert!(by_pattern.is_some());
+        assert_eq!(parse(json!({"op": "glob", "glob": "*.rs"})).unwrap(), by_pattern);
+        assert_eq!(parse(json!({"op": "glob", "glob": ["!t/", "*.rs"]})).unwrap(), by_pattern);
+        assert_eq!(parse(json!({"op": "glob", "glob": "!t/"})).err().as_deref(), Some("glob needs a pattern"));
+        assert_eq!(parse(json!({"op": "glob"})).err().as_deref(), Some("glob needs a pattern"));
+    }
 
     #[test]
     fn near() {

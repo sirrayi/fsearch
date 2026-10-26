@@ -86,6 +86,7 @@ JSON lines over `~/Library/Application Support/FSearch/fsearch.sock`, or
 {"q": "fsearch main", "limit": 20, "offset": 20}
 {"op": "grep", "pattern": "apply_dir", "in": "~/Developer", "context": 2}
 {"q": "main.rs", "boost": true, "near": "~/Developer/app/src/lib.rs", "git": true}
+{"op": "glob", "pattern": "src/**/*.rs", "cwd": "~/Developer/app"}
 {"op": "open", "path": "~/Developer/app/src/main.rs"}
 {"op": "recent", "in": "~/Developer/app"}
 ```
@@ -93,6 +94,9 @@ JSON lines over `~/Library/Application Support/FSearch/fsearch.sock`, or
 `open` tells it what you opened; `"boost": true` ranks those higher for a
 while, `near` favors files close to the one you're in, and `recent` lists
 what you worked on lately. `"git": true` adds each hit's git status.
+`glob` lists the files a pattern matches, relative to `in:`, else `cwd`;
+`"glob"` on any search adds patterns a path must (or, with `!`, must not)
+match.
 
 For coding agents, `fsearch mcp` is an MCP server on stdio with
 `find_files`, `grep` and `multi_grep`.
