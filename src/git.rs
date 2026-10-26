@@ -451,8 +451,8 @@ impl Git {
     /// would then run with the daemon's Full Disk Access. Such a repo gets
     /// no status.
     fn trusted(&self, root: &[u8]) -> bool {
-        let filters = self.run(root, &["config", "--local", "--includes", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], &[]);
-        if filters.as_ref().is_some_and(|f| !f.is_empty()) {
+        let filters = self.run(root, &["config", "--show-scope", "--includes", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], &[]);
+        if filters.as_ref().is_some_and(|f| untrusted_scopes(f)) {
             eprintln!("{} git: {} configures its own filters; not reading its status", fsearch::query::now_secs(), String::from_utf8_lossy(root));
             return false;
         }
@@ -609,6 +609,16 @@ impl Git {
     }
 }
 
+/// `git config --show-scope` output ("local\tfilter.x.clean cat") holds a
+/// filter the repo itself configures: `local` (.git/config) or `worktree`
+/// (.git/config.worktree). A global one isn't a reason not to read it.
+fn untrusted_scopes(out: &[u8]) -> bool {
+    out.split(|&b| b == b'\n').any(|line| {
+        let scope = line.split(|&b| b == b'\t').next().unwrap_or_default();
+        scope == b"local" || scope == b"worktree"
+    })
+}
+
 fn status_args() -> [&'static str; 6] {
     ["status", "--porcelain=v2", "-z", "--ignored=traditional", "--untracked-files=normal", "--ignore-submodules=all"]
 }
@@ -709,6 +719,15 @@ mod tests {
         assert_eq!(Sel::parse("m"), Some(Sel::Modified));
         assert_eq!(Sel::parse("c"), Some(Sel::Clean));
         assert!(Sel::Modified.test(Some(UNTRACKED)) && !Sel::Modified.test(Some(IGNORED)) && !Sel::Clean.test(None));
+    }
+
+    #[test]
+    fn scopes_say_where_a_filter_lives() {
+        // As observed: scope, TAB, then the entry.
+        assert!(untrusted_scopes(b"local\tfilter.x.clean cat\n"));
+        assert!(untrusted_scopes(b"global\tfilter.z.process cat\nworktree\tfilter.y.smudge cat\n"));
+        assert!(!untrusted_scopes(b"global\tfilter.z.process cat\ncommand\tfilter.q.clean cat\n"));
+        assert!(!untrusted_scopes(b""));
     }
 
     #[test]
