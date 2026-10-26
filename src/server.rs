@@ -250,8 +250,21 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
                 (_, Some(Value::Array(a))) => a.iter().filter_map(Value::as_str).collect(),
                 _ => return Err("open needs a path (or paths)".into()),
             };
+            let cwd = v.get("cwd").and_then(Value::as_str).map(real);
             let now = fsearch::query::now_secs();
-            let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&real(p), now)).collect();
+            let mut scores = Vec::with_capacity(paths.len());
+            for p in paths {
+                // A relative path is read in the request's cwd, not the
+                // daemon's own (launchd's is /).
+                let p = match p.starts_with('/') || p.starts_with('~') {
+                    true => real(p),
+                    false => match &cwd {
+                        Some(c) => real(&format!("{}/{p}", String::from_utf8_lossy(c))),
+                        None => return Err("open needs absolute paths (or a cwd)".into()),
+                    },
+                };
+                scores.push(cx.frecency.open(&p, now));
+            }
             Ok(Reply::Value(json!({"ok": true, "scores": scores})))
         }
         "recent" => {
