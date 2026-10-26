@@ -585,6 +585,20 @@ fn real(p: &str) -> Vec<u8> {
     std::fs::canonicalize(&p).map_or_else(|_| p.into_bytes(), |c| c.as_os_str().as_bytes().to_vec())
 }
 
+/// The file a `file` argument names, as a real path: `~` is home only as
+/// "~" or "~/..." (see `real`); a relative file is read in the request's
+/// `cwd`, else in home. Symlinks are resolved where the name resolves —
+/// files are opened O_NOFOLLOW, so a symlink anywhere in the path (a
+/// macOS /etc, /tmp or /var) would read nothing.
+fn named_file(f: &str, cwd: Option<&[u8]>, home: &str) -> Vec<u8> {
+    let p = match f.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')) {
+        Some(r) => [home.as_bytes(), r.as_bytes()].concat(),
+        None if !f.starts_with('/') => [cwd.unwrap_or(home.as_bytes()), b"/".as_slice(), f.as_bytes()].concat(),
+        None => f.as_bytes().to_vec(),
+    };
+    std::fs::canonicalize(std::ffi::OsStr::from_bytes(&p)).map_or(p, |c| c.as_os_str().as_bytes().to_vec())
+}
+
 /// The most hits a search looks through for a page that passes its globs.
 const MAX_FETCH: usize = 20_000;
 /// The most files a grep looks through for a page that passes its globs.
@@ -811,13 +825,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         (None, Some(p)) => fsearch::Grep::with_case(&p, mode, case)?,
         (None, None) => return Err("grep needs a pattern".into()),
     };
-    // `~` is home only as "~" or "~/..." (see `real`); a relative `file`
-    // is read in the request's `cwd`, else in home.
-    let file = v.get("file").and_then(Value::as_str).map(|f| match f.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')) {
-        Some(r) => [engine.home().as_bytes(), r.as_bytes()].concat(),
-        None if !f.starts_with('/') => [x.cwd.as_deref().unwrap_or(engine.home().as_bytes()), b"/".as_slice(), f.as_bytes()].concat(),
-        None => f.as_bytes().to_vec(),
-    });
+    let file = v.get("file").and_then(Value::as_str).map(|f| named_file(f, x.cwd.as_deref(), engine.home()));
     let num = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
     // One file: its matching lines, up to 200 unless told.
     g.max_per_file = num("per_file").unwrap_or(if file.is_some() { 200 } else { g.max_per_file });
@@ -999,6 +1007,23 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `file` through a symlinked parent resolves to its real path;
+    /// "~"/relative names are resolved before that.
+    #[test]
+    fn named_file_is_real() {
+        let dir = std::env::temp_dir().join(format!("fsq-named-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/f.rs"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("lnk")).unwrap();
+        let got = named_file("lnk/f.rs", Some(dir.as_os_str().as_bytes()), "/home");
+        let want = std::fs::canonicalize(dir.join("real/f.rs")).unwrap().as_os_str().as_bytes().to_vec();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got, want);
+        assert_eq!(named_file("f.rs", None, "/h"), b"/h/f.rs");
+        assert_eq!(named_file("~/f.rs", None, "/h"), b"/h/f.rs");
+        assert_eq!(named_file("~bob/f.rs", None, "/h"), b"/h/~bob/f.rs");
+    }
 
     #[test]
     fn near() {
