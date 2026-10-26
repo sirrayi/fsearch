@@ -261,7 +261,13 @@ impl Engine {
             }
         };
         if !skip.is_empty() {
-            let _ = walk::SKIP.set(skip);
+            // SKIP is process-wide: a second engine whose list differs is
+            // told its list didn't take.
+            if let Err(mine) = walk::SKIP.set(skip)
+                && walk::SKIP.get() != Some(&mine)
+            {
+                log("another engine's skip list is already in effect for this process");
+            }
         }
         let dir = opts.dir;
         let loading = Index::load(&dir.join("index.bin"));
