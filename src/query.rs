@@ -802,11 +802,12 @@ impl Part {
         if !s.contains(['?', '[']) {
             return Ok(Part::Star(s.split('*').map(|p| p.to_ascii_lowercase().into_bytes()).collect()));
         }
-        // `*` any run, `?` one byte, `[..]` (or `[!..]`) a class; ASCII case.
+        // `*` any run, `?` one char, `[..]` (or `[!..]`) a class of chars.
         let (mut re, mut run, mut longest) = (String::from("(?is-u)^"), String::new(), String::new());
         let mut cs = s.char_indices();
         while let Some((i, c)) = cs.next() {
-            let close = s[i + 1..].find(']').filter(|_| c == '[');
+            // (Only at a '[': past another char, i + 1 may be inside it.)
+            let close = (c == '[').then(|| s[i + 1..].find(']')).flatten();
             if matches!(c, '*' | '?') || close.is_some() {
                 if run.len() > longest.len() {
                     longest = std::mem::take(&mut run);
@@ -815,17 +816,18 @@ impl Part {
             }
             match (c, close) {
                 ('*', _) => re.push_str(".*"),
-                ('?', _) => re.push('.'),
+                // `?` and a class are one char, not one byte (`caf?` is café).
+                ('?', _) => re.push_str("(?u:.)"),
                 (_, Some(j)) => {
                     let class = &s[i + 1..i + 1 + j];
-                    re.push('[');
+                    re.push_str("(?u:[");
                     if let Some(c) = class.strip_prefix('!') {
                         re.push('^');
                         re.push_str(&c.replace(['\\', '[', '&', '~'], ""));
                     } else {
                         re.push_str(&class.replace(['\\', '[', '&', '~'], ""));
                     }
-                    re.push(']');
+                    re.push_str("])");
                     cs.by_ref().take_while(|&(k, _)| k < i + 1 + j).for_each(drop);
                 }
                 _ => {
@@ -4080,6 +4082,23 @@ mod tests {
     fn mtime_older_than_u32() {
         let q = Query::parse("mtime:>140y", "/h").unwrap();
         assert_eq!(q.mtime, (0, 0));
+    }
+
+    /// A glob with `?` or `[..]` and letters past ASCII parses and matches
+    /// (it read a byte past each letter as if it were the next char), and
+    /// `?` or a class is one char, not one byte.
+    #[test]
+    fn glob_pattern_past_ascii() {
+        let m = |p: &str, name: &str| Part::of(p).unwrap().matches(name.as_bytes());
+        assert!(m("été?.jpg", "été2.jpg") && !m("été?.jpg", "été.jpg"));
+        assert!(m("résumé[12].pdf", "résumé1.pdf") && !m("résumé[12].pdf", "résumé3.pdf"));
+        assert!(m("日本[!x]*", "日本a.txt"));
+        assert!(m("caf?.txt", "café.txt") && m("?t?2.jpg", "été2.jpg") && !m("caf?.txt", "cafe.txt.txt"));
+        assert!(m("[éa]x", "éx") && m("[!é]x", "ax") && !m("[!é]x", "éx"));
+        assert!(m("MAIN?.RS", "main1.rs"));
+        for q in ["été?.jpg", "src/日本[0-9]/*.rs", "\u{feff}?"] {
+            assert!(Query::parse(q, "/h").is_ok(), "{q}");
+        }
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.
