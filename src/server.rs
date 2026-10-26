@@ -135,7 +135,13 @@ fn respond(line: &str, cx: &Ctx, out: &mut Vec<u8>) {
         Err(e) => return put(out, &json!({"ok": false, "error": format!("bad json: {e}")})),
     };
     let id = v.get("id").unwrap_or(&Value::Null);
-    match run(&v, cx) {
+    // A request that panics (a bug; the log has where) is still answered,
+    // not dropped: clients saw only "error" or an empty line.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&v, cx))).unwrap_or_else(|p| {
+        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+        Err(format!("internal error: {}", msg.as_deref().unwrap_or("panic")))
+    });
+    match r {
         Ok(Reply::Hits(found, took_us, next, annotate)) => {
             let hits = found
                 .iter()
