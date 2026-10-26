@@ -1066,7 +1066,15 @@ fn range(v: &str, p: fn(&str) -> Option<u64>) -> Result<(u64, u64), String> {
         return Ok((0, p(r).ok_or_else(bad)?));
     }
     if let Some((a, b)) = v.split_once("..") {
-        return Ok((p(a).ok_or_else(bad)?, p(b).ok_or_else(bad)?));
+        // An empty side is unbounded; a reversed range matches the other way.
+        if a.is_empty() && b.is_empty() {
+            return Err(bad());
+        }
+        let (mut lo, mut hi) = (if a.is_empty() { 0 } else { p(a).ok_or_else(bad)? }, if b.is_empty() { u64::MAX } else { p(b).ok_or_else(bad)? });
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        return Ok((lo, hi));
     }
     let x = p(v).ok_or_else(bad)?;
     Ok((x, x))
@@ -4088,6 +4096,24 @@ mod tests {
     fn words_on_whitespace() {
         assert_eq!(split_words("a\tb\nc"), ["a", "b", "c"]);
         assert_eq!(split_words("\"a\tb\" c"), ["a\tb", "c"]);
+    }
+
+    /// `lo..` and `..hi` are open-ended, `a..b` reversed is `b..a`.
+    #[test]
+    fn ranges() {
+        assert_eq!(Query::parse("size:1mb..", "/h").unwrap().size, (1_000_000, u64::MAX));
+        assert_eq!(Query::parse("size:..7k", "/h").unwrap().size, (0, 7_000));
+        assert_eq!(Query::parse("size:10mb..1mb", "/h").unwrap().size, (1_000_000, 10_000_000));
+        assert!(Query::parse("size:..", "/h").is_err());
+        let now = now_secs();
+        let q = Query::parse("mtime:7d..", "/h").unwrap();
+        assert_eq!(q.mtime.0, 0);
+        assert!(q.mtime.1.abs_diff(now - 7 * 86400) <= 2, "{:?}", q.mtime);
+        let q = Query::parse("mtime:..7d", "/h").unwrap();
+        assert!((q.mtime.0.abs_diff(now - 7 * 86400) <= 2) && (q.mtime.1.abs_diff(now) <= 2), "{:?}", q.mtime);
+        // Reversed: "in the last 7d to 1d ago" said either way.
+        let q = Query::parse("mtime:7d..1d", "/h").unwrap();
+        assert!((q.mtime.0.abs_diff(now - 7 * 86400) <= 2) && (q.mtime.1.abs_diff(now - 86400) <= 2), "{:?}", q.mtime);
     }
 
     /// `in:~` and `in:~/x` scope to home; `in:~bob` is a literal name.
