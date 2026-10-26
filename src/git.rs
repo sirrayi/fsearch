@@ -599,6 +599,9 @@ impl Git {
         // Before it's waited for: a signal must never find a reaped pid here.
         RUNNING.store(0, Ordering::Relaxed);
         if out.is_none() {
+            // The whole process group (it's its own): children git spawned
+            // hold its stdout open, so killing only git never ends the read.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.kill();
         }
         let ok = child.wait().is_ok_and(|s| s.success());
