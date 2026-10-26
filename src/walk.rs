@@ -204,6 +204,19 @@ pub(crate) const NOFOLLOW: i32 = libc::O_NOFOLLOW;
 
 const OPEN_DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY | NOFOLLOW | libc::O_CLOEXEC;
 
+/// open/openat that waits out EMFILE/ENFILE (the scan's own threads free
+/// their fds constantly): 20 retries, 5 ms apart, then give up as before.
+fn open_dir_fd(f: impl Fn() -> i32) -> i32 {
+    for i in 0..=20 {
+        let fd = f();
+        if fd >= 0 || i == 20 || !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+            return fd;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    -1
+}
+
 /// Directory fd shared by the tasks that still need to openat() a child.
 struct Fd(i32);
 impl Drop for Fd {
@@ -262,7 +275,7 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
     for (name, cid, child_path) in kids {
         let parent = me.clone();
         s.spawn(move |s| {
-            let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
+            let fd = open_dir_fd(|| unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) });
             drop(parent);
             if fd < 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -316,7 +329,7 @@ fn rd64(b: &[u8], at: usize) -> u64 {
 /// Returns false if the directory could not be opened.
 fn list_into(path: &[u8], l: &mut Listing) -> bool {
     let Ok(cpath) = CString::new(path) else { return false };
-    let fd = unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) };
+    let fd = open_dir_fd(|| unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) });
     if fd < 0 {
         return false;
     }
