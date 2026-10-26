@@ -1674,28 +1674,53 @@ impl<'a> Scope<'a> {
 }
 
 /// The global excludes file, as git finds it: core.excludesFile in the
-/// user's git config, else ~/.config/git/ignore.
+/// user's git config, else git/ignore under their config dir. Git reads
+/// $XDG_CONFIG_HOME/git/config when set and non-empty (else ~/.config);
+/// ~/.gitconfig wins over it.
 fn excludes_file(home: &[u8]) -> Vec<u8> {
-    for config in [&b"/.gitconfig"[..], b"/.config/git/config"] {
-        let Ok(text) = std::fs::read(OsStr::from_bytes(&[home, config].concat())) else { continue };
-        let (mut core, mut found) = (false, None);
-        for l in text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii) {
-            if l.starts_with(b"[") {
-                core = l.eq_ignore_ascii_case(b"[core]");
-            } else if let Some(eq) = l.iter().position(|&b| b == b'=')
-                && core
-                && l[..eq].trim_ascii().eq_ignore_ascii_case(b"excludesfile")
-            {
-                let v = l[eq + 1..].trim_ascii();
-                let v = v.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")).unwrap_or(v);
-                found = Some(v.strip_prefix(b"~").map_or(v.to_vec(), |r| [home, r].concat()));
-            }
-        }
-        if let Some(f) = found {
+    let base =
+        std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()).map_or_else(|| join(home, b".config"), |x| x.as_os_str().as_bytes().to_vec());
+    for config in [join(home, b".gitconfig"), join(&base, b"git/config")] {
+        if let Ok(text) = std::fs::read(OsStr::from_bytes(&config))
+            && let Some(f) = excludes_in(&text, home)
+        {
             return f;
         }
     }
-    [home, b"/.config/git/ignore"].concat()
+    join(&base, b"git/ignore")
+}
+
+/// core.excludesFile in git config `text`, if set there (the last wins).
+fn excludes_in(text: &[u8], home: &[u8]) -> Option<Vec<u8>> {
+    let (mut core, mut found) = (false, None);
+    for l in text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii) {
+        if l.starts_with(b"[") {
+            // `[core]`, `[ core ]`, `[core] # x`: core. `[core "x"]` isn't.
+            core = l[1..].split(|&b| b == b']').next().map(<[u8]>::trim_ascii).is_some_and(|h| h.eq_ignore_ascii_case(b"core"));
+        } else if let Some(eq) = l.iter().position(|&b| b == b'=')
+            && core
+            && l[..eq].trim_ascii().eq_ignore_ascii_case(b"excludesfile")
+        {
+            let v = &l[eq + 1..];
+            // An unquoted # or ; starts a comment; quotes then come off.
+            let (mut q, mut cut) = (false, v.len());
+            for (i, &b) in v.iter().enumerate() {
+                match b {
+                    b'"' => q = !q,
+                    b'#' | b';' if !q => {
+                        cut = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let v = v[..cut].trim_ascii();
+            let v = v.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")).unwrap_or(v);
+            // `~` is home only as "~" or "~/...".
+            found = Some(v.strip_prefix(b"~").filter(|r| r.is_empty() || r.starts_with(b"/")).map_or(v.to_vec(), |r| [home, r].concat()));
+        }
+    }
+    found
 }
 
 /// The git dir of the repo rooted at `dir`: its `.git`, or for a worktree
@@ -4741,6 +4766,22 @@ fn open_ahead_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core.excludesFile as git reads it: loose section headers, unquoted
+    /// comments cut, `~` home only as "~/...".
+    #[test]
+    fn excludes_parsing() {
+        let x = |t: &str| excludes_in(t.as_bytes(), b"/h").map(|p| String::from_utf8_lossy(&p).into_owned());
+        assert_eq!(x("[core]\n\texcludesFile = ~/.gi\n").as_deref(), Some("/h/.gi"));
+        assert_eq!(x("[ core ] # yes\nexcludesfile = /g/x\n").as_deref(), Some("/g/x"));
+        assert_eq!(x("[core \"sub\"]\nexcludesfile = /g/x\n"), None);
+        assert_eq!(x("[other]\nexcludesfile = /g/x\n"), None);
+        assert_eq!(x("[core]\nexcludesfile = ~/gi # mine\n").as_deref(), Some("/h/gi"));
+        assert_eq!(x("[core]\nexcludesfile = /g/x ; mine\n").as_deref(), Some("/g/x"));
+        assert_eq!(x("[core]\nexcludesfile = \"/g/#a\" # c\n").as_deref(), Some("/g/#a"));
+        assert_eq!(x("[core]\nexcludesfile = ~foo\n").as_deref(), Some("~foo"));
+        assert_eq!(x("[core]\nexcludesfile = ~\n").as_deref(), Some("/h"));
+    }
     use crate::walk::{Listing, RawEnt};
 
     /// The lines of `buf` a grep shows.
