@@ -127,6 +127,9 @@ unsafe impl Sync for Stream {}
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
         unsafe {
             let a = api();
             (a.stop)(self.0);
@@ -155,6 +158,12 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> S
         let s = (a.create)(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
         (a.cf_release)(arr);
         (a.cf_release)(root);
+        if s.is_null() {
+            // No stream took the callback context: it's ours to free.
+            drop(Box::from_raw(ctx.info as *mut Info));
+            eprintln!("{} fsevents: stream creation failed", crate::query::now_secs());
+            return Stream(std::ptr::null_mut());
+        }
         // The callback only copies paths out, but it must not queue behind
         // busy threads (a first build runs on every core at user-initiated
         // QoS): fseventsd drops what a client falls behind on, and the drop
@@ -162,7 +171,9 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> S
         let qos = libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
         (a.set_queue)(s, q);
-        (a.start)(s);
+        if (a.start)(s) == 0 {
+            eprintln!("{} fsevents: stream failed to start", crate::query::now_secs());
+        }
         Stream(s)
     }
 }
