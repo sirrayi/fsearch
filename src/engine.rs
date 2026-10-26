@@ -213,14 +213,28 @@ fn warmer() -> &'static std::thread::Thread {
     })
 }
 
+/// A panic in a background thread killed it quietly, leaving the daemon
+/// answering from a frozen index forever: it stops the engine instead
+/// (`Engine::stopped`), so the daemon can exit and be restarted.
+static STOPPED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
+    let name = name.to_string();
     std::thread::Builder::new()
-        .name(name.into())
+        .name(name.clone())
         .spawn(move || {
             no_materialize();
-            f()
+            run_guarded(&name, f)
         })
         .expect("spawn");
+}
+
+fn run_guarded(name: &str, f: impl FnOnce()) {
+    if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        let msg = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
+        log(format!("{name} stopped: {msg}"));
+        let _ = STOPPED.set(msg);
+    }
 }
 
 impl Engine {
@@ -247,7 +261,13 @@ impl Engine {
             }
         };
         if !skip.is_empty() {
-            let _ = walk::SKIP.set(skip);
+            // SKIP is process-wide: a second engine whose list differs is
+            // told its list didn't take.
+            if let Err(mine) = walk::SKIP.set(skip)
+                && walk::SKIP.get() != Some(&mine)
+            {
+                log("another engine's skip list is already in effect for this process");
+            }
         }
         let dir = opts.dir;
         let loading = Index::load(&dir.join("index.bin"));
@@ -443,6 +463,12 @@ impl Engine {
             full_disk_access: walk::SKIP.get().is_none(),
             owner: self.s.owner(),
         }
+    }
+
+    /// Why the engine stopped (a background thread panicked), if it did:
+    /// the index no longer follows the disk; restart to recover.
+    pub fn stopped(&self) -> Option<&'static str> {
+        STOPPED.get().map(|s| s.as_str())
     }
 
     /// The answer while the first index builds, with its progress.
@@ -1231,5 +1257,12 @@ mod tests {
     fn skip_entries() {
         follower("skip", "/h");
         assert!(walk::blocked(b"/nonexistent-fsearch-skip/x") && !walk::blocked(b"/usr"));
+    }
+
+    /// A panicking background thread stops the engine (`stopped`).
+    #[test]
+    fn panic_stops_the_engine() {
+        run_guarded("fsearch-test", || panic!("boom"));
+        assert!(STOPPED.get().is_some());
     }
 }

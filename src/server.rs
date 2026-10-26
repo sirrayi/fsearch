@@ -41,6 +41,20 @@ pub fn serve(dir: PathBuf, home: String) {
     };
     let g = git.clone();
     engine.on_change(move |dirs| g.changed(dirs));
+    // A stopped engine serves a frozen index: exit, so a launchd KeepAlive
+    // (or the next client, which starts a daemon on demand) restarts us.
+    {
+        let e = engine.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if let Some(m) = e.stopped() {
+                    eprintln!("{} engine stopped: {m}; exiting so the daemon restarts", fsearch::query::now_secs());
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
     let cx = Arc::new(Ctx { engine, git, frecency: Frecency::load(dir.join("frecency")) });
     let sock = socket_path(&dir);
     let _ = std::fs::remove_file(&sock);
@@ -75,13 +89,21 @@ fn try_lock(f: &std::fs::File) -> bool {
 pub fn stop(dir: &Path) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
+    let ours = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
     let mut killed = None;
     for _ in 0..300 {
         if try_lock(&lock) {
             return Ok(());
         }
         if killed.is_none() {
-            killed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+            // Until the new daemon writes its pid the file holds the
+            // previous one's, which may now be an unrelated process: read
+            // it each pass, and signal only a process named like us.
+            killed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .filter(|&p| p > 1)
+                .filter(|&p| proc_name(p).is_some_and(|n| name_is_ours(&n, &ours)));
             if let Some(pid) = killed {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }
@@ -92,6 +114,20 @@ pub fn stop(dir: &Path) -> Result<(), String> {
         Some(pid) => format!("daemon {pid} did not exit"),
         None => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
+}
+
+/// A pid's process name (proc_name truncates to 16 bytes).
+fn proc_name(pid: i32) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 32];
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| buf[..n as usize].to_vec())
+}
+
+/// The pid's process name is our executable's (it truncates to 16 bytes
+/// the same way) or, for a daemon renamed in place, "fsearch".
+fn name_is_ours(got: &[u8], ours: &str) -> bool {
+    let ours = ours.as_bytes();
+    got == &ours[..ours.len().min(16)] || got == b"fsearch"
 }
 
 /// How long the cores stay clocked up after an answer to a client that is
@@ -214,8 +250,21 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
                 (_, Some(Value::Array(a))) => a.iter().filter_map(Value::as_str).collect(),
                 _ => return Err("open needs a path (or paths)".into()),
             };
+            let cwd = v.get("cwd").and_then(Value::as_str).map(real);
             let now = fsearch::query::now_secs();
-            let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&real(p), now)).collect();
+            let mut scores = Vec::with_capacity(paths.len());
+            for p in paths {
+                // A relative path is read in the request's cwd, not the
+                // daemon's own (launchd's is /).
+                let p = match p.starts_with('/') || p.starts_with('~') {
+                    true => real(p),
+                    false => match &cwd {
+                        Some(c) => real(&format!("{}/{p}", String::from_utf8_lossy(c))),
+                        None => return Err("open needs absolute paths (or a cwd)".into()),
+                    },
+                };
+                scores.push(cx.frecency.open(&p, now));
+            }
             Ok(Reply::Value(json!({"ok": true, "scores": scores})))
         }
         "recent" => {
@@ -345,7 +394,7 @@ impl Extras {
         };
         if let Some(o) = at {
             // Past what a page can be fetched from, every page is empty.
-            x.offset = (o.as_u64().or_else(|| o.as_str()?.parse().ok()).ok_or("offset must be a number")?).min(MAX_FETCH as u64) as usize;
+            x.offset = (count(o).or_else(|| o.as_str()?.parse().ok()).ok_or("offset must be a number")?).min(MAX_FETCH as u64) as usize;
         }
         let mut globs: Vec<&str> = match v.get("glob") {
             None => Vec::new(),
@@ -878,7 +927,7 @@ fn parse_request(v: &Value, home: &str) -> Result<(Query, Vec<(git::Sel, bool)>)
                 continue;
             }
             if k == "limit" {
-                q.limit = val.as_u64().ok_or("limit must be a number")? as usize;
+                q.limit = count(val).ok_or("limit must be a number")? as usize;
             } else {
                 let s = match val {
                     Value::String(s) => s.clone(),
@@ -889,6 +938,12 @@ fn parse_request(v: &Value, home: &str) -> Result<(Query, Vec<(git::Sel, bool)>)
         }
     }
     Ok((q, sels))
+}
+
+/// A JSON number as a count: a u64, or a finite non-negative whole f64
+/// (models send 20.0).
+fn count(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64))
 }
 
 /// A query's `git:` words (`git:modified`, `!git:ignored`), and the rest.
@@ -943,7 +998,12 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
     // Set here too, so the daemon a search starts needn't restart itself
     // in it (main.rs `space_efficient`): 4 ms off that first answer.
     cmd.env("MallocSpaceEfficient", "1");
-    cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    let mut child = cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    // Ours to reap: in a long-lived client (mcp, stdio) an exited daemon
+    // would stay a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     for _ in 0..1500 {
         std::thread::sleep(Duration::from_millis(2));
         if let Ok(s) = UnixStream::connect(&sock) {
@@ -956,6 +1016,22 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A count as a whole number, however the client wrote it.
+    #[test]
+    fn counts() {
+        assert_eq!((count(&json!(20)), count(&json!(20.0))), (Some(20), Some(20)));
+        assert_eq!((count(&json!(20.5)), count(&json!(-1)), count(&json!("20"))), (None, None, None));
+    }
+
+    /// A pid is ours when proc_name shows our name (16 bytes at most).
+    #[test]
+    fn process_name_is_ours() {
+        assert!(name_is_ours(b"fsearch", "fsearch"));
+        assert!(name_is_ours(b"fsearch-longer-n", "fsearch-longer-name"), "both truncate to 16 bytes");
+        assert!(name_is_ours(b"fsearch", "anything-else"), "the daemon's own name");
+        assert!(!name_is_ours(b"bash", "fsearch") && !name_is_ours(b"", "fsearch"));
+    }
 
     #[test]
     fn near() {

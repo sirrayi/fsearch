@@ -49,7 +49,10 @@ impl Frecency {
             let (Some(s), Some(t), Some(p)) = (f.next(), f.next(), f.next()) else { continue };
             let num = |b: &[u8]| -> Option<f64> { std::str::from_utf8(b).ok()?.parse().ok() };
             let p = if p.first() == Some(&b'"') { serde_json::from_slice::<String>(p).ok().map(String::into_bytes) } else { Some(p.to_vec()) };
-            if let (Some(s), Some(t), Some(p)) = (num(s), num(t), p) {
+            // "nan"/"inf"/"-1" parse fine; a score that isn't finite and
+            // non-negative is dropped, not carried into sorting and boosts.
+            let s = num(s).filter(|s| s.is_finite() && *s >= 0.0);
+            if let (Some(s), Some(t), Some(p)) = (s, num(t), p) {
                 map.insert(p, (s as f32, t as u32));
             }
         }
@@ -148,6 +151,21 @@ mod tests {
         let g = Frecency::load(dir.join("frecency"));
         assert!((g.score(b"/p/src/a.rs", t + 1000) - 2.0).abs() < 0.01, "saved");
         assert!((g.score(b"/p/a\nb.rs", t) - 1.0).abs() < 0.01, "a newline in a name is kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A saved score that isn't a finite, non-negative number is dropped.
+    #[test]
+    fn bad_scores_are_dropped() {
+        let dir = std::env::temp_dir().join(format!("fsearch-frecency-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = fsearch::query::now_secs();
+        std::fs::write(dir.join("frecency"), format!("nan\t1\t/p/a\ninf\t1\t/p/b\n-1\t1\t/p/c\n2\t{now}\t/p/d\n")).unwrap();
+        let f = Frecency::load(dir.join("frecency"));
+        assert!(f.score(b"/p/d", now) > 0.0);
+        for p in [b"/p/a", b"/p/b", b"/p/c"] {
+            assert_eq!(f.score(&p[..], now), 0.0);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
