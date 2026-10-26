@@ -1037,13 +1037,13 @@ fn normalized(s: &str, form: isize) -> Option<String> {
     }
 }
 
-/// Split on spaces, keeping "double quoted" runs together.
+/// Split on whitespace, keeping "double quoted" runs together.
 fn split_words(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
     for c in s.chars() {
         match c {
             '"' => quoted = !quoted,
-            ' ' if !quoted => {
+            c if c.is_whitespace() && !quoted => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                 }
@@ -4081,6 +4081,13 @@ mod tests {
     fn mtime_older_than_u32() {
         let q = Query::parse("mtime:>140y", "/h").unwrap();
         assert_eq!(q.mtime, (0, 0));
+    }
+
+    /// Tabs and newlines separate words too; quoted whitespace doesn't.
+    #[test]
+    fn words_on_whitespace() {
+        assert_eq!(split_words("a\tb\nc"), ["a", "b", "c"]);
+        assert_eq!(split_words("\"a\tb\" c"), ["a\tb", "c"]);
     }
 
     /// `in:~` and `in:~/x` scope to home; `in:~bob` is a literal name.
