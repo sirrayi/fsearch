@@ -1257,7 +1257,10 @@ fn file_uri(u: &str) -> Option<String> {
         i += 1;
     }
     let s = String::from_utf8(out).ok()?;
-    Some(s.trim_end_matches('/').to_string()).filter(|s| s.starts_with('/'))
+    let t = s.trim_end_matches('/');
+    // Nothing but slashes ("file:///"): the root folder.
+    let t = if t.is_empty() && s.starts_with('/') { "/" } else { t };
+    Some(t.to_string()).filter(|s| s.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -1348,6 +1351,15 @@ mod tests {
         assert_eq!(cursor(&json!({"cursor": "  "})), Ok(0));
         assert!(cursor(&json!({"cursor": -1})).is_err());
         assert!(cursor(&json!({"cursor": "-1"})).is_err() && cursor(&json!({"cursor": "x"})).is_err());
+    }
+
+    /// "file:///" is the root folder; a URI path keeps its meaning.
+    #[test]
+    fn root_uri() {
+        assert_eq!(file_uri("file:///"), Some("/".to_string()));
+        assert_eq!(file_uri("file:///a%20b/"), Some("/a b".to_string()));
+        assert_eq!(file_uri("file://x"), None);
+        assert_eq!(file_uri("http://x"), None);
     }
 
     #[test]
