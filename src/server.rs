@@ -210,10 +210,14 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
         "open" => {
             // An editor or agent opened these: they rank higher for a while.
             let paths: Vec<&str> = match (v.get("path"), v.get("paths")) {
-                (Some(Value::String(p)), _) => vec![p],
+                (Some(Value::String(p)), _) => vec![p.as_str()],
                 (_, Some(Value::Array(a))) => a.iter().filter_map(Value::as_str).collect(),
-                _ => return Err("open needs a path (or paths)".into()),
+                _ => Vec::new(),
             };
+            let paths: Vec<&str> = paths.into_iter().filter(|p| !p.is_empty()).collect();
+            if paths.is_empty() {
+                return Err("open needs a path (or paths)".into());
+            }
             let now = fsearch::query::now_secs();
             let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&real(p), now)).collect();
             Ok(Reply::Value(json!({"ok": true, "scores": scores})))
