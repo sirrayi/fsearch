@@ -103,9 +103,11 @@ fn handle(mut conn: UnixStream, cx: &Ctx) {
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
     let Ok(r) = conn.try_clone() else { return };
     let mut out = Vec::new();
-    for line in BufReader::new(r).lines() {
+    // Lines as bytes: one that isn't UTF-8 gets a "bad json" reply, where
+    // `lines()` ended the connection without one.
+    for line in BufReader::new(r).split(b'\n') {
         let Ok(line) = line else { return };
-        if line.trim().is_empty() {
+        if line.trim_ascii().is_empty() {
             continue;
         }
         out.clear();
@@ -129,8 +131,8 @@ fn waiting(conn: &UnixStream) -> bool {
 }
 
 /// The answer to one request line, as one line of JSON.
-fn respond(line: &str, cx: &Ctx, out: &mut Vec<u8>) {
-    let v: Value = match serde_json::from_str(line) {
+fn respond(line: &[u8], cx: &Ctx, out: &mut Vec<u8>) {
+    let v: Value = match serde_json::from_slice(line) {
         Ok(v) => v,
         Err(e) => return put(out, &json!({"ok": false, "error": format!("bad json: {e}")})),
     };
