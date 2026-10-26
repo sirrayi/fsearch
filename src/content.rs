@@ -1322,10 +1322,16 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
             at = off[k] + sec.len();
         }
         f.write_all(&vec![0u8; ((at + 63) & !63) - at])?;
-        f.flush()
+        f.flush()?;
+        // Durable before the rename: a power loss must not leave a
+        // renamed segment of zeros.
+        f.get_ref().sync_data()?;
+        std::fs::rename(&tmp, &p)
     };
-    write().ok()?;
-    std::fs::rename(&tmp, &p).ok()?;
+    if write().is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
     Segment::load(dir, id)
 }
 

@@ -916,16 +916,24 @@ impl Index {
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
+    /// A failed write removes its tmp: index.tmp is the size of the index.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
         let mut f = std::fs::File::create(&tmp)?;
-        // The header with the current event id (the rest as built).
-        let mut h = self.map[..HDR].to_vec();
-        h[8 + 4 * 8..][..16].copy_from_slice(&[self.event_id.to_le_bytes(), (self.synced_at as u64).to_le_bytes()].concat());
-        f.write_all(&h)?;
-        f.write_all(&self.map[HDR..])?;
-        f.sync_data()?;
-        std::fs::rename(tmp, path)
+        let write = |f: &mut std::fs::File| -> std::io::Result<()> {
+            // The header with the current event id (the rest as built).
+            let mut h = self.map[..HDR].to_vec();
+            h[8 + 4 * 8..][..16].copy_from_slice(&[self.event_id.to_le_bytes(), (self.synced_at as u64).to_le_bytes()].concat());
+            f.write_all(&h)?;
+            f.write_all(&self.map[HDR..])?;
+            f.sync_data()?;
+            std::fs::rename(&tmp, path)
+        };
+        let r = write(&mut f);
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
     }
 
     /// The event id a saved index is current as of, from its header alone.
