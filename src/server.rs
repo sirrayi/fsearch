@@ -998,7 +998,12 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
     // Set here too, so the daemon a search starts needn't restart itself
     // in it (main.rs `space_efficient`): 4 ms off that first answer.
     cmd.env("MallocSpaceEfficient", "1");
-    cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    let mut child = cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    // Ours to reap: in a long-lived client (mcp, stdio) an exited daemon
+    // would stay a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     for _ in 0..1500 {
         std::thread::sleep(Duration::from_millis(2));
         if let Ok(s) = UnixStream::connect(&sock) {
