@@ -114,13 +114,10 @@ fn print_one(req: &serde_json::Value, raw: bool) {
 fn stdio() {
     let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     let mut up = s.try_clone().unwrap();
+    // Bytes as they come: the daemon answers a line that isn't UTF-8, where
+    // `lines()` stopped reading at it.
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            if writeln!(up, "{line}").is_err() {
-                break;
-            }
-        }
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut up);
         let _ = up.shutdown(std::net::Shutdown::Write);
     });
     let mut out = std::io::stdout().lock();

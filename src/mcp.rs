@@ -34,20 +34,14 @@ pub fn run(dir: PathBuf) {
     let mut s = Session::new(dir);
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
+    // Lines as bytes: one that isn't UTF-8 is a parse error, where
+    // `lines()` ended the session without a word.
+    for line in stdin.lock().split(b'\n') {
         let Ok(line) = line else { break };
-        if line.trim().is_empty() {
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(Value::Array(batch)) if batch.is_empty() => Some(error(&Value::Null, -32600, "invalid request: an empty batch")),
-            Ok(Value::Array(batch)) => {
-                let r: Vec<Value> = batch.iter().filter_map(|m| s.message(m)).collect();
-                (!r.is_empty()).then_some(Value::Array(r))
-            }
-            Ok(m) => s.message(&m),
-            Err(e) => Some(error(&Value::Null, -32700, &format!("parse error: {e}"))),
-        };
+        let reply = s.line(&line);
         for m in reply.into_iter().chain(s.outbox.drain(..)) {
             if writeln!(out, "{m}").and_then(|_| out.flush()).is_err() {
                 return;
@@ -85,6 +79,19 @@ impl Session {
         let real = |p: String| std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
         let root = real(repo_root(&cwd, &home).unwrap_or(cwd));
         Session { dir, home, root, outbox: Vec::new(), asked_roots: 0, asks: Default::default() }
+    }
+
+    /// The reply to one line from the client (a message or a batch), if any.
+    fn line(&mut self, line: &[u8]) -> Option<Value> {
+        match serde_json::from_slice::<Value>(line) {
+            Ok(Value::Array(batch)) if batch.is_empty() => Some(error(&Value::Null, -32600, "invalid request: an empty batch")),
+            Ok(Value::Array(batch)) => {
+                let r: Vec<Value> = batch.iter().filter_map(|m| self.message(m)).collect();
+                (!r.is_empty()).then_some(Value::Array(r))
+            }
+            Ok(m) => self.message(&m),
+            Err(e) => Some(error(&Value::Null, -32700, &format!("parse error: {e}"))),
+        }
     }
 
     /// The reply to one message, if it needs one.
@@ -1253,6 +1260,15 @@ fn file_uri(u: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line that isn't UTF-8 is a parse error, and the session goes on.
+    #[test]
+    fn non_utf8_line() {
+        let mut s = Session::new(std::env::temp_dir());
+        assert_eq!(s.line(b"\xff\xfe\r").unwrap()["error"]["code"], -32700);
+        let ping = s.line(br#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#).unwrap();
+        assert_eq!((&ping["id"], ping.get("error")), (&json!(7), None));
+    }
 
     #[test]
     fn splits_queries() {
