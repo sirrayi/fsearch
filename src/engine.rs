@@ -623,7 +623,9 @@ fn note_skipped(dir: &Path) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
-    if let Err(e) = std::fs::write(dir.join(SKIPPED), out) {
+    // Write-then-rename: a crash mid-write mustn't leave a half list.
+    let (path, tmp) = (dir.join(SKIPPED), dir.join("skipped.new"));
+    if let Err(e) = std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &path)) {
         log(format!("save failed: {e}"));
     }
 }
