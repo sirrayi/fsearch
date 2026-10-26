@@ -900,7 +900,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         "candidates": r.candidates,
         "read": r.read,
         "complete": r.complete,
-        "indexing": engine.status().content_pending,
+        "indexing": engine.content_pending(),
         "files": files,
     });
     if let Some(n) = next {

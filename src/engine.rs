@@ -439,10 +439,15 @@ impl Engine {
             content_docs: c.docs(),
             content_segments: c.segs.len(),
             content_bytes: c.bytes(),
-            content_pending: self.s.content_pending.load(Ordering::Relaxed),
+            content_pending: self.content_pending(),
             full_disk_access: walk::SKIP.get().is_none(),
             owner: self.s.owner(),
         }
+    }
+
+    /// Files queued for the content index, without touching its locks.
+    pub fn content_pending(&self) -> usize {
+        self.s.content_pending.load(Ordering::Relaxed)
     }
 
     /// The answer while the first index builds, with its progress.
