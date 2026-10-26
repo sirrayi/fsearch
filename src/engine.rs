@@ -101,6 +101,8 @@ struct Shared {
     content_pending: AtomicUsize,
     /// Files changed since their folder's last content sync.
     dirty: content::Dirty,
+    /// Whether Full Disk Access was granted, checked once at start.
+    fda: bool,
     /// Holding `lock`: this engine writes the index files. Another process
     /// may own them (the daemon, an app); then this one follows: it reads
     /// the saved index, keeps it live in memory, and takes over when the
@@ -237,10 +239,11 @@ impl Engine {
         // lock dies with the process.
         let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
         let owner = try_lock(&lock);
+        let fda = has_full_disk_access();
         let skip: Vec<Vec<u8>> = match opts.skip {
             // ("/a/" is /a; an empty entry would block everything.)
             Some(v) => v.iter().map(|p| crate::live::normalize(p.as_os_str().as_bytes())).filter(|p| !p.is_empty()).collect(),
-            None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
+            None if fda && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
             None => {
                 log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
                 gated(&opts.home)
@@ -267,6 +270,7 @@ impl Engine {
             content_rx: Mutex::new(Some(crx)),
             content_pending: AtomicUsize::new(0),
             dirty: Default::default(),
+            fda,
             owner: AtomicBool::new(owner),
             lock,
             stream: Mutex::new(None),
@@ -439,10 +443,15 @@ impl Engine {
             content_docs: c.docs(),
             content_segments: c.segs.len(),
             content_bytes: c.bytes(),
-            content_pending: self.s.content_pending.load(Ordering::Relaxed),
-            full_disk_access: walk::SKIP.get().is_none(),
+            content_pending: self.content_pending(),
+            full_disk_access: self.s.fda,
             owner: self.s.owner(),
         }
+    }
+
+    /// Files queued for the content index, without touching its locks.
+    pub fn content_pending(&self) -> usize {
+        self.s.content_pending.load(Ordering::Relaxed)
     }
 
     /// The answer while the first index builds, with its progress.
@@ -614,7 +623,9 @@ fn note_skipped(dir: &Path) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
-    if let Err(e) = std::fs::write(dir.join(SKIPPED), out) {
+    // Write-then-rename: a crash mid-write mustn't leave a half list.
+    let (path, tmp) = (dir.join(SKIPPED), dir.join("skipped.new"));
+    if let Err(e) = std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &path)) {
         log(format!("save failed: {e}"));
     }
 }

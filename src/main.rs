@@ -14,7 +14,7 @@ use std::time::Instant;
 static GLOBAL: fsearch::alloc::Alloc = fsearch::alloc::Alloc;
 
 const USAGE: &str = "usage:
-  fsearch <query...> [--json]   search (starts the daemon if needed)
+  fsearch [--json] [--] <query...>  search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
   fsearch mcp                   MCP server on stdin/stdout, for coding agents
   fsearch serve                 run the daemon in the foreground
@@ -58,9 +58,17 @@ fn main() {
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
-        Some(_) => {
-            let json = args.iter().any(|a| a == "--json");
-            let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
+        Some("--") | Some(_) => {
+            // `--` ends the options: everything after it is the query,
+            // verbatim (`fsearch -- status` finds a file named status).
+            let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+            let json = args[..at].iter().any(|a| a == "--json");
+            let q: Vec<&str> = args[..at]
+                .iter()
+                .map(String::as_str)
+                .filter(|a| *a != "--json")
+                .chain(args[(at + 1).min(args.len())..].iter().map(String::as_str))
+                .collect();
             // The folder `git:` filters and globs are about, unless `in:` says.
             let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
             print_one(&serde_json::json!({"q": q.join(" "), "cwd": cwd}), json);
@@ -86,13 +94,20 @@ fn space_efficient() {
 
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    s.write_all(format!("{req}\n").as_bytes()).unwrap();
+    s.write_all(format!("{req}\n").as_bytes()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     // One request only: the daemon needn't keep the cores warm for a next one.
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).unwrap();
+    BufReader::new(&s).read_line(&mut line).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
+    if line.is_empty() {
+        die(&format!("the daemon closed the connection without answering; see {}/daemon.log", data_dir().display()));
+    }
     if raw {
         print!("{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if v["ok"] != true {
+            std::process::exit(1);
+        }
         return;
     }
     let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
@@ -113,7 +128,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
 
 fn stdio() {
     let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    let mut up = s.try_clone().unwrap();
+    let mut up = s.try_clone().unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -210,12 +225,17 @@ fn install(login: bool) {
     let target = format!("{}/{LABEL}", domain());
     launchctl(&["bootout", &target]);
     server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
-    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    let bindir = bin.parent().unwrap();
+    std::fs::create_dir_all(bindir).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", bindir.display())));
     // Replace, never overwrite in place: a rewritten signed binary at the same
     // path can be SIGKILLed by the code-signing cache. Copy then rename, so
     // reinstalling from the installed copy works too.
     let tmp = bin.with_extension("new");
-    std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
+    if let Err(e) = std::fs::copy(&exe, &tmp).and_then(|_| std::fs::rename(&tmp, &bin)) {
+        let _ = std::fs::remove_file(&tmp);
+        die(&format!("copy: {e}"));
+    }
     let agents =
         format!("for coding agents: claude mcp add -s user fsearch -- {0} mcp\n                   codex mcp add fsearch -- {0} mcp", bin.display());
     if !login {
@@ -237,14 +257,18 @@ fn install(login: bool) {
 </dict>
 </plist>
 "#,
-        bin.display(),
-        log.display(),
-        log.display()
+        xml_escape(&bin.display().to_string()),
+        xml_escape(&log.display().to_string()),
+        xml_escape(&log.display().to_string())
     );
-    std::fs::write(plist_path(), plist).unwrap();
+    let path = plist_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", dir.display())));
+    }
+    std::fs::write(&path, plist).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
     // bootout returns before the old job is fully gone; bootstrap fails
     // until it is.
-    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+    let bootstrap = || launchctl(&["bootstrap", &domain(), path.to_str().unwrap()]);
     let retry = || {
         std::thread::sleep(std::time::Duration::from_millis(100));
         false
@@ -253,6 +277,11 @@ fn install(login: bool) {
         die("launchctl bootstrap failed");
     }
     println!("installed {} (LaunchAgent {LABEL})\n{agents}", bin.display());
+}
+
+/// A string safe inside a plist's XML.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
 fn uninstall() {
@@ -264,4 +293,14 @@ fn uninstall() {
 fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml() {
+        assert_eq!(xml_escape("/a&b/c<'d'>\"e\""), "/a&amp;b/c&lt;&apos;d&apos;&gt;&quot;e&quot;");
+    }
 }

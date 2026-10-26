@@ -7,7 +7,7 @@ use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_OTHER};
 use fsearch::{Engine, Found, GrepMode, Options, Query};
 use regex::bytes::Regex;
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -51,9 +51,23 @@ pub fn serve(dir: PathBuf, home: String) {
             return;
         }
     };
-    for conn in listener.incoming().flatten() {
-        let cx = cx.clone();
-        std::thread::spawn(move || handle(conn, &cx));
+    // A persistent accept error (out of fds, say) must not spin at 100%
+    // CPU: back off, and log it at most once per 10 s per error kind.
+    let mut last: Option<(std::io::ErrorKind, Instant)> = None;
+    for conn in listener.incoming() {
+        match conn {
+            Ok(conn) => {
+                let cx = cx.clone();
+                std::thread::spawn(move || handle(conn, &cx));
+            }
+            Err(e) => {
+                if last.is_none_or(|(k, t)| k != e.kind() || t.elapsed() >= Duration::from_secs(10)) {
+                    eprintln!("{} accept: {e}", fsearch::query::now_secs());
+                    last = Some((e.kind(), Instant::now()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -98,18 +112,44 @@ pub fn stop(dir: &Path) -> Result<(), String> {
 /// still connected (typing): most gaps between keystrokes are shorter.
 const WARM: Duration = Duration::from_millis(250);
 
+/// The most bytes one request line may take: `lines()` would grow an
+/// endless line without bound.
+const MAX_LINE: usize = 16 << 20;
+
 fn handle(mut conn: UnixStream, cx: &Ctx) {
     // Content searches run on this thread: keep them on performance cores.
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
     let Ok(r) = conn.try_clone() else { return };
+    let mut reader = BufReader::new(r);
+    let mut buf = Vec::new();
     let mut out = Vec::new();
-    for line in BufReader::new(r).lines() {
-        let Ok(line) = line else { return };
-        if line.trim().is_empty() {
+    loop {
+        buf.clear();
+        let n = match (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n == 0 {
+            return;
+        }
+        if buf.len() > MAX_LINE && buf.last() != Some(&b'\n') {
+            let _ = conn.write_all(b"{\"ok\":false,\"error\":\"request too long\"}\n");
+            return;
+        }
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
         out.clear();
-        respond(&line, cx, &mut out);
+        match std::str::from_utf8(&buf) {
+            Ok(line) => respond(line, cx, &mut out),
+            Err(_) => put(&mut out, &json!({"ok": false, "error": "bad json: not UTF-8"})),
+        }
         if conn.write_all(&out).is_err() {
             return;
         }
@@ -535,13 +575,28 @@ fn git_root(dir: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// A path as the index has it: `~` expanded, symlinks resolved.
+/// A path as the index has it: `~` expanded, symlinks resolved. `~` is
+/// home only as "~" or "~/..."; "~bob" is a name, not a user lookup.
 fn real(p: &str) -> Vec<u8> {
-    let p = match p.strip_prefix('~') {
+    let p = match p.strip_prefix('~').filter(|rest| rest.is_empty() || rest.starts_with('/')) {
         Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
         None => p.to_string(),
     };
     std::fs::canonicalize(&p).map_or_else(|_| p.into_bytes(), |c| c.as_os_str().as_bytes().to_vec())
+}
+
+/// The file a `file` argument names, as a real path: `~` is home only as
+/// "~" or "~/..." (see `real`); a relative file is read in the request's
+/// `cwd`, else in home. Symlinks are resolved where the name resolves —
+/// files are opened O_NOFOLLOW, so a symlink anywhere in the path (a
+/// macOS /etc, /tmp or /var) would read nothing.
+fn named_file(f: &str, cwd: Option<&[u8]>, home: &str) -> Vec<u8> {
+    let p = match f.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')) {
+        Some(r) => [home.as_bytes(), r.as_bytes()].concat(),
+        None if !f.starts_with('/') => [cwd.unwrap_or(home.as_bytes()), b"/".as_slice(), f.as_bytes()].concat(),
+        None => f.as_bytes().to_vec(),
+    };
+    std::fs::canonicalize(std::ffi::OsStr::from_bytes(&p)).map_or(p, |c| c.as_os_str().as_bytes().to_vec())
 }
 
 /// The most hits a search looks through for a page that passes its globs.
@@ -770,11 +825,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         (None, Some(p)) => fsearch::Grep::with_case(&p, mode, case)?,
         (None, None) => return Err("grep needs a pattern".into()),
     };
-    let file = v.get("file").and_then(Value::as_str).map(|f| match f.strip_prefix('~') {
-        Some(r) => format!("{}{r}", engine.home()),
-        None if !f.starts_with('/') => format!("{}/{f}", engine.home()),
-        None => f.to_string(),
-    });
+    let file = v.get("file").and_then(Value::as_str).map(|f| named_file(f, x.cwd.as_deref(), engine.home()));
     let num = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
     // One file: its matching lines, up to 200 unless told.
     g.max_per_file = num("per_file").unwrap_or(if file.is_some() { 200 } else { g.max_per_file });
@@ -787,7 +838,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
     let t = Instant::now();
     let source = |indexed| if indexed { "index" } else { "scan" };
     let (r, source, next) = if let Some(f) = &file {
-        let r = fsearch::content::grep_file(&g, f.as_bytes());
+        let r = fsearch::content::grep_file(&g, f);
         let next = r.next;
         (r, "file", next)
     } else if x.plain() {
@@ -857,7 +908,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         "candidates": r.candidates,
         "read": r.read,
         "complete": r.complete,
-        "indexing": engine.status().content_pending,
+        "indexing": engine.content_pending(),
         "files": files,
     });
     if let Some(n) = next {
@@ -957,10 +1008,37 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 mod tests {
     use super::*;
 
+    /// A `file` through a symlinked parent resolves to its real path;
+    /// "~"/relative names are resolved before that.
+    #[test]
+    fn named_file_is_real() {
+        let dir = std::env::temp_dir().join(format!("fsq-named-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/f.rs"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("lnk")).unwrap();
+        let got = named_file("lnk/f.rs", Some(dir.as_os_str().as_bytes()), "/home");
+        let want = std::fs::canonicalize(dir.join("real/f.rs")).unwrap().as_os_str().as_bytes().to_vec();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got, want);
+        assert_eq!(named_file("f.rs", None, "/h"), b"/h/f.rs");
+        assert_eq!(named_file("~/f.rs", None, "/h"), b"/h/f.rs");
+        assert_eq!(named_file("~bob/f.rs", None, "/h"), b"/h/~bob/f.rs");
+    }
+
     #[test]
     fn near() {
         let n = |a: &str, b: &str| nearness(a.as_bytes(), b.as_bytes());
         assert_eq!((n("/p/src/a.rs", "/p/src/b.rs"), n("/p/src/a.rs", "/p/src/a.rs")), (12, -20));
         assert_eq!((n("/p/src/a.rs", "/p/src/ui/c.rs"), n("/p/src/a.rs", "/p/docs/x.md"), n("/p/a/b/c/d.rs", "/q/e.rs")), (9, 6, 0));
+    }
+
+    #[test]
+    fn tilde() {
+        let home = std::env::var("HOME").unwrap();
+        // A path that does not exist comes back verbatim once `~` expands.
+        let gone = "~/fsearch-tilde-test-no-such-path";
+        assert_eq!(real(gone), format!("{home}{}", &gone[1..]).into_bytes());
+        assert_eq!(real("~bob"), b"~bob".to_vec());
+        assert_eq!(real("~"), std::fs::canonicalize(&home).map_or_else(|_| home.into_bytes(), |c| c.as_os_str().as_bytes().to_vec()));
     }
 }
