@@ -845,13 +845,15 @@ fn arg_num(a: &Value, key: &str, default: usize) -> usize {
     if n.is_finite() && n >= 0.5 { (n.round() as usize).min(1000) } else { default }
 }
 
-/// The page offset a cursor carries (cursors are offsets: no state to lose).
+/// The page offset a cursor carries (cursors are offsets: no state to
+/// lose). Models send 20, 20.0 or "20.0": a finite non-negative f64.
 fn cursor(a: &Value) -> Result<usize, String> {
+    let page = |f: f64| (f.is_finite() && f >= 0.0).then_some(f.round() as usize);
     match &a["cursor"] {
         Value::Null => Ok(0),
-        Value::Number(n) => Ok(n.as_u64().unwrap_or(0) as usize),
+        Value::Number(n) => n.as_f64().and_then(page).ok_or_else(|| format!("bad cursor {n}")),
         Value::String(s) if s.trim().is_empty() => Ok(0),
-        Value::String(s) => s.trim().parse().map_err(|_| format!("bad cursor {s}")),
+        Value::String(s) => s.trim().parse().ok().and_then(page).ok_or_else(|| format!("bad cursor {s}")),
         other => Err(format!("bad cursor {other}")),
     }
 }
@@ -1202,12 +1204,20 @@ fn clip(line: &str, pat: &str, max: usize) -> String {
     format!("{}{}{}", if start > 0 { "…" } else { "" }, &t[start..end], if end < t.len() { "…" } else { "" })
 }
 
-/// A file's text (for context lines), if it reads as text.
+/// A file's text (for context lines), if it reads as text, up to 8 MB.
 fn read_text(path: &str) -> String {
-    match std::fs::read(path) {
-        Ok(b) if b.len() <= 8 << 20 => String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
-        _ => String::new(),
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK keeps a FIFO from hanging open (and its read ends at once).
+    let mut f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
+        Ok(f) if f.metadata().is_ok_and(|m| m.is_file()) => f,
+        _ => return String::new(),
+    };
+    let mut b = Vec::new();
+    if (&mut f).take((8 << 20) + 1).read_to_end(&mut b).is_err() || b.len() > 8 << 20 {
+        return String::new();
     }
+    String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Is `path` `dir` or inside it?
@@ -1247,7 +1257,10 @@ fn file_uri(u: &str) -> Option<String> {
         i += 1;
     }
     let s = String::from_utf8(out).ok()?;
-    Some(s.trim_end_matches('/').to_string()).filter(|s| s.starts_with('/'))
+    let t = s.trim_end_matches('/');
+    // Nothing but slashes ("file:///"): the root folder.
+    let t = if t.is_empty() && s.starts_with('/') { "/" } else { t };
+    Some(t.to_string()).filter(|s| s.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -1326,6 +1339,27 @@ mod tests {
         let r = json!({"files": [d, f("/p/src/b.rs", "parse")], "next": 1});
         let out = v.list_matches(&r, "parse", false, Some("parse"), Out::Content, 2, 0, 0, None);
         assert_ne!(out.lines().find_map(|l| l.strip_prefix("cursor: ")), Some("0"));
+    }
+
+    /// A cursor as 20, 20.0 or "20.0" is page 20; negative or junk is an error.
+    #[test]
+    fn cursors() {
+        assert_eq!(cursor(&json!({"cursor": 20.0})), Ok(20));
+        assert_eq!(cursor(&json!({"cursor": "20.0"})), Ok(20));
+        assert_eq!(cursor(&json!({"cursor": 20})), Ok(20));
+        assert_eq!(cursor(&json!({})), Ok(0));
+        assert_eq!(cursor(&json!({"cursor": "  "})), Ok(0));
+        assert!(cursor(&json!({"cursor": -1})).is_err());
+        assert!(cursor(&json!({"cursor": "-1"})).is_err() && cursor(&json!({"cursor": "x"})).is_err());
+    }
+
+    /// "file:///" is the root folder; a URI path keeps its meaning.
+    #[test]
+    fn root_uri() {
+        assert_eq!(file_uri("file:///"), Some("/".to_string()));
+        assert_eq!(file_uri("file:///a%20b/"), Some("/a b".to_string()));
+        assert_eq!(file_uri("file://x"), None);
+        assert_eq!(file_uri("http://x"), None);
     }
 
     #[test]

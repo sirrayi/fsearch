@@ -306,9 +306,12 @@ impl Git {
         paths.filter(|(p, _)| p.starts_with(dir) && p.get(dir.len()) == Some(&b'/')).collect()
     }
 
-    /// Repos already known at or under `dir`.
+    /// Repos already known at or under `dir` (a trailing '/' in `dir`
+    /// bounds by itself: / matches every root).
     pub fn known_under(&self, dir: &[u8]) -> Vec<Arc<Repo>> {
-        self.repos.lock().unwrap().iter().filter(|r| r.root.starts_with(dir) && r.root.get(dir.len()).is_none_or(|&b| b == b'/')).cloned().collect()
+        let under =
+            |r: &&Arc<Repo>| r.root.starts_with(dir) && (r.root.len() == dir.len() || dir.ends_with(b"/") || r.root.get(dir.len()) == Some(&b'/'));
+        self.repos.lock().unwrap().iter().filter(under).cloned().collect()
     }
 
     /// FSEvents saw these folders change (`Engine::on_change`; true: and
@@ -448,8 +451,8 @@ impl Git {
     /// would then run with the daemon's Full Disk Access. Such a repo gets
     /// no status.
     fn trusted(&self, root: &[u8]) -> bool {
-        let filters = self.run(root, &["config", "--local", "--includes", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], &[]);
-        if filters.as_ref().is_some_and(|f| !f.is_empty()) {
+        let filters = self.run(root, &["config", "--show-scope", "--includes", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], &[]);
+        if filters.as_ref().is_some_and(|f| untrusted_scopes(f)) {
             eprintln!("{} git: {} configures its own filters; not reading its status", fsearch::query::now_secs(), String::from_utf8_lossy(root));
             return false;
         }
@@ -596,11 +599,24 @@ impl Git {
         // Before it's waited for: a signal must never find a reaped pid here.
         RUNNING.store(0, Ordering::Relaxed);
         if out.is_none() {
+            // The whole process group (it's its own): children git spawned
+            // hold its stdout open, so killing only git never ends the read.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.kill();
         }
         let ok = child.wait().is_ok_and(|s| s.success());
         out.filter(|_| ok)
     }
+}
+
+/// `git config --show-scope` output ("local\tfilter.x.clean cat") holds a
+/// filter the repo itself configures: `local` (.git/config) or `worktree`
+/// (.git/config.worktree). A global one isn't a reason not to read it.
+fn untrusted_scopes(out: &[u8]) -> bool {
+    out.split(|&b| b == b'\n').any(|line| {
+        let scope = line.split(|&b| b == b'\t').next().unwrap_or_default();
+        scope == b"local" || scope == b"worktree"
+    })
 }
 
 fn status_args() -> [&'static str; 6] {
@@ -703,6 +719,24 @@ mod tests {
         assert_eq!(Sel::parse("m"), Some(Sel::Modified));
         assert_eq!(Sel::parse("c"), Some(Sel::Clean));
         assert!(Sel::Modified.test(Some(UNTRACKED)) && !Sel::Modified.test(Some(IGNORED)) && !Sel::Clean.test(None));
+    }
+
+    #[test]
+    fn scopes_say_where_a_filter_lives() {
+        // As observed: scope, TAB, then the entry.
+        assert!(untrusted_scopes(b"local\tfilter.x.clean cat\n"));
+        assert!(untrusted_scopes(b"global\tfilter.z.process cat\nworktree\tfilter.y.smudge cat\n"));
+        assert!(!untrusted_scopes(b"global\tfilter.z.process cat\ncommand\tfilter.q.clean cat\n"));
+        assert!(!untrusted_scopes(b""));
+    }
+
+    #[test]
+    fn known_at_or_under() {
+        let g = Git::new("/nonexistent");
+        let r = g.add(b"/p/repo");
+        let has = |dir: &[u8]| g.known_under(dir).iter().any(|o| Arc::ptr_eq(o, &r));
+        assert!(has(b"/") && has(b"/p") && has(b"/p/repo"));
+        assert!(!has(b"/p/re") && !has(b"/q"));
     }
 
     #[test]

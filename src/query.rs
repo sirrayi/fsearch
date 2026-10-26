@@ -594,7 +594,8 @@ impl Query {
                 })
             }
             "in" => {
-                let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
+                // `~` is home only as "~" or "~/..."; "~bob" is a name.
+                let p = v.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')).map_or(v.to_string(), |r| format!("{home}{r}"));
                 self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
             }
             "size" => self.size = range(v, parse_size)?,
@@ -941,13 +942,47 @@ fn parts_match(parts: &[Part], names: &[&[u8]]) -> bool {
     }
 }
 
-/// `w` with its brace groups expanded: `*.{c,h}` is `*.c` and `*.h`.
+/// `w` with its brace groups expanded: `*.{c,h}` is `*.c` and `*.h`;
+/// nested groups expand too (`*.{rs,{c,h}}`).
 fn expand_braces(w: &str) -> Vec<String> {
     let Some(open) = w.find('{') else { return vec![w.to_string()] };
-    let Some(len) = w[open..].find('}') else { return vec![w.to_string()] };
-    let (head, body, tail) = (&w[..open], &w[open + 1..open + len], &w[open + len + 1..]);
+    // Its match: the '}' back at depth 0.
+    let mut depth = 0;
+    let close = w[open..].char_indices().find_map(|(i, c)| match c {
+        '{' => {
+            depth += 1;
+            None
+        }
+        '}' => {
+            depth -= 1;
+            (depth == 0).then_some(i)
+        }
+        _ => None,
+    });
+    let Some(close) = close else { return vec![w.to_string()] };
+    let (head, body, tail) = (&w[..open], &w[open + 1..open + close], &w[open + close + 1..]);
     let tails = expand_braces(tail);
-    body.split(',').flat_map(|b| tails.iter().map(move |t| format!("{head}{b}{t}"))).take(64).collect()
+    // Commas at the body's own depth only; an alternative may nest more.
+    split_top(body).into_iter().flat_map(expand_braces).flat_map(|b| tails.iter().map(move |t| format!("{head}{b}{t}"))).take(64).collect()
+}
+
+/// `body`'s comma-separated alternatives, ignoring commas in nested braces.
+fn split_top(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&body[start..]);
+    out
 }
 
 /// An `Alt` from one brace-free alternative.
@@ -1036,13 +1071,13 @@ fn normalized(s: &str, form: isize) -> Option<String> {
     }
 }
 
-/// Split on spaces, keeping "double quoted" runs together.
+/// Split on whitespace, keeping "double quoted" runs together.
 fn split_words(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
     for c in s.chars() {
         match c {
             '"' => quoted = !quoted,
-            ' ' if !quoted => {
+            c if c.is_whitespace() && !quoted => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                 }
@@ -1065,7 +1100,15 @@ fn range(v: &str, p: fn(&str) -> Option<u64>) -> Result<(u64, u64), String> {
         return Ok((0, p(r).ok_or_else(bad)?));
     }
     if let Some((a, b)) = v.split_once("..") {
-        return Ok((p(a).ok_or_else(bad)?, p(b).ok_or_else(bad)?));
+        // An empty side is unbounded; a reversed range matches the other way.
+        if a.is_empty() && b.is_empty() {
+            return Err(bad());
+        }
+        let (mut lo, mut hi) = (if a.is_empty() { 0 } else { p(a).ok_or_else(bad)? }, if b.is_empty() { u64::MAX } else { p(b).ok_or_else(bad)? });
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        return Ok((lo, hi));
     }
     let x = p(v).ok_or_else(bad)?;
     Ok((x, x))
@@ -4080,6 +4123,49 @@ mod tests {
     fn mtime_older_than_u32() {
         let q = Query::parse("mtime:>140y", "/h").unwrap();
         assert_eq!(q.mtime, (0, 0));
+    }
+
+    /// Tabs and newlines separate words too; quoted whitespace doesn't.
+    #[test]
+    fn words_on_whitespace() {
+        assert_eq!(split_words("a\tb\nc"), ["a", "b", "c"]);
+        assert_eq!(split_words("\"a\tb\" c"), ["a\tb", "c"]);
+    }
+
+    /// Brace groups expand, nested ones too.
+    #[test]
+    fn braces() {
+        assert_eq!(expand_braces("a.{rs,{c,h}}"), ["a.rs", "a.c", "a.h"]);
+        assert_eq!(expand_braces("*.{c,h}"), ["*.c", "*.h"]);
+        assert_eq!(expand_braces("a.{x,{y,{p,q}}},z"), ["a.x,z", "a.y,z", "a.p,z", "a.q,z"]);
+        assert_eq!(expand_braces("no"), ["no"]);
+        assert_eq!(expand_braces("un{closed"), ["un{closed"]);
+    }
+
+    /// `lo..` and `..hi` are open-ended, `a..b` reversed is `b..a`.
+    #[test]
+    fn ranges() {
+        assert_eq!(Query::parse("size:1mb..", "/h").unwrap().size, (1_000_000, u64::MAX));
+        assert_eq!(Query::parse("size:..7k", "/h").unwrap().size, (0, 7_000));
+        assert_eq!(Query::parse("size:10mb..1mb", "/h").unwrap().size, (1_000_000, 10_000_000));
+        assert!(Query::parse("size:..", "/h").is_err());
+        let now = now_secs();
+        let q = Query::parse("mtime:7d..", "/h").unwrap();
+        assert_eq!(q.mtime.0, 0);
+        assert!(q.mtime.1.abs_diff(now - 7 * 86400) <= 2, "{:?}", q.mtime);
+        let q = Query::parse("mtime:..7d", "/h").unwrap();
+        assert!((q.mtime.0.abs_diff(now - 7 * 86400) <= 2) && (q.mtime.1.abs_diff(now) <= 2), "{:?}", q.mtime);
+        // Reversed: "in the last 7d to 1d ago" said either way.
+        let q = Query::parse("mtime:7d..1d", "/h").unwrap();
+        assert!((q.mtime.0.abs_diff(now - 7 * 86400) <= 2) && (q.mtime.1.abs_diff(now - 86400) <= 2), "{:?}", q.mtime);
+    }
+
+    /// `in:~` and `in:~/x` scope to home; `in:~bob` is a literal name.
+    #[test]
+    fn tilde_scope() {
+        assert_eq!(Query::parse("in:~/x", "/h").unwrap().scope.as_deref(), Some(&b"/h/x"[..]));
+        assert_eq!(Query::parse("in:~", "/h").unwrap().scope.as_deref(), Some(&b"/h"[..]));
+        assert_eq!(Query::parse("in:~bob", "/h").unwrap().scope.as_deref(), Some(&b"~bob"[..]));
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.

@@ -461,6 +461,14 @@ fn dead_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("seg-{id:06}.dead"))
 }
 
+/// The files of segments no manifest names anymore (see `drop_segments`).
+fn delete_files(dir: &Path, ids: &[u64]) {
+    for id in ids {
+        let _ = std::fs::remove_file(seg_path(dir, *id));
+        let _ = std::fs::remove_file(dead_path(dir, *id));
+    }
+}
+
 #[inline]
 fn varint(b: &[u8]) -> (u32, usize) {
     let mut v = 0u32;
@@ -1322,10 +1330,16 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
             at = off[k] + sec.len();
         }
         f.write_all(&vec![0u8; ((at + 63) & !63) - at])?;
-        f.flush()
+        f.flush()?;
+        // Durable before the rename: a power loss must not leave a
+        // renamed segment of zeros.
+        f.get_ref().sync_data()?;
+        std::fs::rename(&tmp, &p)
     };
-    write().ok()?;
-    std::fs::rename(&tmp, &p).ok()?;
+    if write().is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
     Segment::load(dir, id)
 }
 
@@ -1464,15 +1478,18 @@ fn skip_list(home: &[u8]) -> Vec<Vec<u8>> {
     let text = path.and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
     (text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii))
         .filter(|l| !l.is_empty() && !l.starts_with(b"#"))
-        .map(|l| {
-            let l = l.strip_suffix(b"/").unwrap_or(l);
-            match l.strip_prefix(b"~") {
-                Some(rest) => [home, rest].concat(),
-                None if l.starts_with(b"/") => l.to_vec(),
-                None => join(home, l),
-            }
-        })
+        .map(|l| skip_line(home, l.strip_suffix(b"/").unwrap_or(l)))
         .collect()
+}
+
+/// One skip-list line as an absolute path. `~` is home only as "~" or
+/// "~/...": "~bob" is a literal name, relative like other relative lines.
+fn skip_line(home: &[u8], l: &[u8]) -> Vec<u8> {
+    match l.strip_prefix(b"~").filter(|r| r.is_empty() || r.starts_with(b"/")) {
+        Some(rest) => [home, rest].concat(),
+        None if l.starts_with(b"/") => l.to_vec(),
+        None => join(home, l),
+    }
 }
 
 /// Ignore files parsed so far, by path, with the (size, mtime) they were
@@ -2312,6 +2329,7 @@ impl Content {
             self.drop_segments(&empty);
             self.link();
             self.save_manifest();
+            delete_files(&self.dir, &empty);
         }
         todo.sort();
         if !todo.is_empty() {
@@ -2418,14 +2436,14 @@ impl Content {
         self.segs.insert(at, seg);
         self.link();
         self.save_manifest();
+        delete_files(&self.dir, ids);
     }
 
+    /// Out of `self.segs`. Their files go last (`delete_files`), once the
+    /// manifest no longer names them: a crash in between must not leave a
+    /// manifest naming deleted segments.
     fn drop_segments(&mut self, ids: &[u64]) {
         self.segs.retain(|s| !ids.contains(&s.id));
-        for id in ids {
-            let _ = std::fs::remove_file(seg_path(&self.dir, *id));
-            let _ = std::fs::remove_file(dead_path(&self.dir, *id));
-        }
     }
 
     /// Candidate docs for a pattern, filtered by the name query: in groups
@@ -3781,7 +3799,7 @@ fn lines_at(g: &Grep, buf: &[u8], found: impl Iterator<Item = (usize, usize)>) -
             counted = start;
             ls = memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1);
             le = memchr::memchr(b'\n', &buf[start..]).map_or(buf.len(), |p| start + p);
-            raw = &buf[ls..le.min(ls + 400)];
+            raw = &buf[ls..ls + cut(&buf[ls..le], 400)];
             let text = String::from_utf8_lossy(raw);
             utf8 = matches!(text, std::borrow::Cow::Borrowed(_));
             lines.push((line_no, text.trim_end().to_string()));
@@ -3837,7 +3855,20 @@ fn on_lines<'a>(re: &'a Regex, buf: &'a [u8]) -> impl Iterator<Item = (usize, us
 
 /// A line as shown: its first 400 bytes, trailing space trimmed.
 fn shown(line: &[u8]) -> String {
-    String::from_utf8_lossy(&line[..line.len().min(400)]).trim_end().to_string()
+    String::from_utf8_lossy(&line[..cut(line, 400)]).trim_end().to_string()
+}
+
+/// `max` bytes of `b`, backed off a UTF-8 character's start (at most 3
+/// bytes): a cut inside one would turn the whole line lossy.
+fn cut(b: &[u8], max: usize) -> usize {
+    let mut n = max.min(b.len());
+    for _ in 0..3 {
+        if b.get(n).is_none_or(|&c| c & 0xC0 != 0x80) {
+            break;
+        }
+        n -= 1;
+    }
+    n
 }
 
 /// Up to `n` lines before the line starting at `ls`, in order.
@@ -4827,5 +4858,29 @@ mod tests {
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// `~` in the skip list is home only as "~" or "~/...".
+    #[test]
+    fn skip_line_tilde() {
+        assert_eq!(skip_line(b"/h", b"~/a"), b"/h/a");
+        assert_eq!(skip_line(b"/h", b"~"), b"/h");
+        assert_eq!(skip_line(b"/h", b"~bob"), b"/h/~bob");
+        assert_eq!(skip_line(b"/h", b"rel"), b"/h/rel");
+        assert_eq!(skip_line(b"/h", b"/abs"), b"/abs");
+    }
+
+    /// A shown line is cut at a character, not inside one.
+    #[test]
+    fn long_line_cut_at_char() {
+        let mut line = vec![b'a'; 399];
+        line.extend_from_slice("é".as_bytes());
+        line.extend_from_slice(b"bcdef");
+        let s = shown(&line);
+        assert_eq!(s.len(), 399);
+        assert!(!s.contains('\u{FFFD}'));
+        // At 4 the whole é is in; at 3 it would split, so back to its start.
+        assert_eq!((cut(b"ab\xC3\xA9x", 4), cut(b"ab\xC3\xA9x", 3), cut(b"ab\xF0\x9F\x98\x80x", 4)), (4, 2, 2));
+        assert_eq!(cut(b"abc", 400), 3);
     }
 }

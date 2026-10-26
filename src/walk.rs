@@ -157,11 +157,30 @@ fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
     out
 }
 
+/// Raise the open-files limit as far as macOS allows, once per process.
+/// rlim_cur above kern.maxfilesperproc fails EINVAL (rlim_max is
+/// RLIM_INFINITY under launchd, so uncapped we'd try and stay at 256);
+/// and a limit already higher is left alone.
 fn raise_fd_limit() {
-    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
-    r.rlim_cur = r.rlim_max.min(65536);
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
+        // kern.maxfilesperproc is an int; a failed or nonpositive read
+        // leaves the cap unknown (don't take it as 0).
+        let mut per_proc: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&per_proc);
+        let name = c"kern.maxfilesperproc";
+        let cap = unsafe {
+            libc::sysctlbyname(name.as_ptr(), (&mut per_proc as *mut libc::c_int).cast(), &mut len, std::ptr::null_mut(), 0) == 0 && per_proc > 0
+        }
+        .then_some(per_proc as u64);
+        let want = r.rlim_max.min(65536).min(cap.unwrap_or(u64::MAX));
+        if want > r.rlim_cur {
+            r.rlim_cur = want;
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+        }
+    });
 }
 
 /// List a single directory (no recursion). Subdirectories come back with
@@ -188,6 +207,19 @@ pub(crate) const NOFOLLOW: i32 = libc::O_NOFOLLOW_ANY;
 pub(crate) const NOFOLLOW: i32 = libc::O_NOFOLLOW;
 
 const OPEN_DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY | NOFOLLOW | libc::O_CLOEXEC;
+
+/// open/openat that waits out EMFILE/ENFILE (the scan's own threads free
+/// their fds constantly): 20 retries, 5 ms apart, then give up as before.
+fn open_dir_fd(f: impl Fn() -> i32) -> i32 {
+    for i in 0..=20 {
+        let fd = f();
+        if fd >= 0 || i == 20 || !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+            return fd;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    -1
+}
 
 /// Directory fd shared by the tasks that still need to openat() a child.
 struct Fd(i32);
@@ -247,7 +279,7 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
     for (name, cid, child_path) in kids {
         let parent = me.clone();
         s.spawn(move |s| {
-            let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
+            let fd = open_dir_fd(|| unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) });
             drop(parent);
             if fd < 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -301,7 +333,7 @@ fn rd64(b: &[u8], at: usize) -> u64 {
 /// Returns false if the directory could not be opened.
 fn list_into(path: &[u8], l: &mut Listing) -> bool {
     let Ok(cpath) = CString::new(path) else { return false };
-    let fd = unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) };
+    let fd = open_dir_fd(|| unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) });
     if fd < 0 {
         return false;
     }
