@@ -30,7 +30,6 @@ pub fn serve(dir: PathBuf, home: String) {
     }
     // The pid lets `stop` find us.
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
-    let git = Git::new(&home);
     git::kill_on_term();
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
         Ok(e) => e,
@@ -39,6 +38,8 @@ pub fn serve(dir: PathBuf, home: String) {
             return;
         }
     };
+    // Home as the engine resolved it: folders are compared to it as real paths.
+    let git = Git::new(engine.home());
     let g = git.clone();
     engine.on_change(move |dirs| g.changed(dirs));
     let cx = Arc::new(Ctx { engine, git, frecency: Frecency::load(dir.join("frecency")) });

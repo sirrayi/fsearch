@@ -233,6 +233,11 @@ impl Engine {
         if opts.home.len() > 1 && opts.home.ends_with('/') {
             opts.home = opts.home.trim_end_matches('/').to_string();
         }
+        // The index holds real paths: a home reached through a symlink
+        // (/tmp, a moved home) matched nothing, so content indexed nothing.
+        if let Some(real) = std::fs::canonicalize(&opts.home).ok().and_then(|p| p.into_os_string().into_string().ok()) {
+            opts.home = real;
+        }
         // One writer per index: a second one would race index writes. The
         // lock dies with the process.
         let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
@@ -1223,6 +1228,19 @@ mod tests {
     fn home_with_trailing_slash() {
         assert_eq!(gated("/h/")[0], b"/h/Desktop");
         assert_eq!(follower("home", "/h//").home(), "/h");
+    }
+
+    /// A home reached through a symlink is its real path, as the index's paths are.
+    #[test]
+    fn home_through_symlink() {
+        let d = std::env::temp_dir().join(format!("fsearch-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", d.join("lnk")).unwrap();
+        let got = follower("symhome", d.join("lnk/").to_str().unwrap()).home().to_string();
+        let want = std::fs::canonicalize(d.join("real")).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(got, want.to_str().unwrap());
     }
 
     /// Skip entries are folders however written: "/a/" is /a, and an empty
