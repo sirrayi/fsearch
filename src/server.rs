@@ -575,9 +575,10 @@ fn git_root(dir: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// A path as the index has it: `~` expanded, symlinks resolved.
+/// A path as the index has it: `~` expanded, symlinks resolved. `~` is
+/// home only as "~" or "~/..."; "~bob" is a name, not a user lookup.
 fn real(p: &str) -> Vec<u8> {
-    let p = match p.strip_prefix('~') {
+    let p = match p.strip_prefix('~').filter(|rest| rest.is_empty() || rest.starts_with('/')) {
         Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
         None => p.to_string(),
     };
@@ -810,10 +811,12 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         (None, Some(p)) => fsearch::Grep::with_case(&p, mode, case)?,
         (None, None) => return Err("grep needs a pattern".into()),
     };
-    let file = v.get("file").and_then(Value::as_str).map(|f| match f.strip_prefix('~') {
-        Some(r) => format!("{}{r}", engine.home()),
-        None if !f.starts_with('/') => format!("{}/{f}", engine.home()),
-        None => f.to_string(),
+    // `~` is home only as "~" or "~/..." (see `real`); a relative `file`
+    // is read in the request's `cwd`, else in home.
+    let file = v.get("file").and_then(Value::as_str).map(|f| match f.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/')) {
+        Some(r) => [engine.home().as_bytes(), r.as_bytes()].concat(),
+        None if !f.starts_with('/') => [x.cwd.as_deref().unwrap_or(engine.home().as_bytes()), b"/".as_slice(), f.as_bytes()].concat(),
+        None => f.as_bytes().to_vec(),
     });
     let num = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
     // One file: its matching lines, up to 200 unless told.
@@ -827,7 +830,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
     let t = Instant::now();
     let source = |indexed| if indexed { "index" } else { "scan" };
     let (r, source, next) = if let Some(f) = &file {
-        let r = fsearch::content::grep_file(&g, f.as_bytes());
+        let r = fsearch::content::grep_file(&g, f);
         let next = r.next;
         (r, "file", next)
     } else if x.plain() {
@@ -1002,5 +1005,15 @@ mod tests {
         let n = |a: &str, b: &str| nearness(a.as_bytes(), b.as_bytes());
         assert_eq!((n("/p/src/a.rs", "/p/src/b.rs"), n("/p/src/a.rs", "/p/src/a.rs")), (12, -20));
         assert_eq!((n("/p/src/a.rs", "/p/src/ui/c.rs"), n("/p/src/a.rs", "/p/docs/x.md"), n("/p/a/b/c/d.rs", "/q/e.rs")), (9, 6, 0));
+    }
+
+    #[test]
+    fn tilde() {
+        let home = std::env::var("HOME").unwrap();
+        // A path that does not exist comes back verbatim once `~` expands.
+        let gone = "~/fsearch-tilde-test-no-such-path";
+        assert_eq!(real(gone), format!("{home}{}", &gone[1..]).into_bytes());
+        assert_eq!(real("~bob"), b"~bob".to_vec());
+        assert_eq!(real("~"), std::fs::canonicalize(&home).map_or_else(|_| home.into_bytes(), |c| c.as_os_str().as_bytes().to_vec()));
     }
 }
