@@ -157,11 +157,26 @@ fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
     out
 }
 
+/// Raise the open-files limit as far as macOS allows, once per process.
+/// rlim_cur above kern.maxfilesperproc fails EINVAL (rlim_max is
+/// RLIM_INFINITY under launchd, so uncapped we'd try and stay at 256);
+/// and a limit already higher is left alone.
 fn raise_fd_limit() {
-    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
-    r.rlim_cur = r.rlim_max.min(65536);
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
+        let mut per_proc: usize = 0;
+        let mut len = std::mem::size_of_val(&per_proc);
+        let name = c"kern.maxfilesperproc";
+        let cap = unsafe { libc::sysctlbyname(name.as_ptr(), (&mut per_proc as *mut usize).cast(), &mut len, std::ptr::null_mut(), 0) == 0 }
+            .then_some(per_proc as u64);
+        let want = r.rlim_max.min(65536).min(cap.unwrap_or(u64::MAX));
+        if want > r.rlim_cur {
+            r.rlim_cur = want;
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+        }
+    });
 }
 
 /// List a single directory (no recursion). Subdirectories come back with
