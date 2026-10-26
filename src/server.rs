@@ -89,13 +89,21 @@ fn try_lock(f: &std::fs::File) -> bool {
 pub fn stop(dir: &Path) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
+    let ours = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
     let mut killed = None;
     for _ in 0..300 {
         if try_lock(&lock) {
             return Ok(());
         }
         if killed.is_none() {
-            killed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+            // Until the new daemon writes its pid the file holds the
+            // previous one's, which may now be an unrelated process: read
+            // it each pass, and signal only a process named like us.
+            killed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .filter(|&p| p > 1)
+                .filter(|&p| proc_name(p).is_some_and(|n| name_is_ours(&n, &ours)));
             if let Some(pid) = killed {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }
@@ -106,6 +114,20 @@ pub fn stop(dir: &Path) -> Result<(), String> {
         Some(pid) => format!("daemon {pid} did not exit"),
         None => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
+}
+
+/// A pid's process name (proc_name truncates to 16 bytes).
+fn proc_name(pid: i32) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 32];
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| buf[..n as usize].to_vec())
+}
+
+/// The pid's process name is our executable's (it truncates to 16 bytes
+/// the same way) or, for a daemon renamed in place, "fsearch".
+fn name_is_ours(got: &[u8], ours: &str) -> bool {
+    let ours = ours.as_bytes();
+    got == &ours[..ours.len().min(16)] || got == b"fsearch"
 }
 
 /// How long the cores stay clocked up after an answer to a client that is
@@ -970,6 +992,15 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pid is ours when proc_name shows our name (16 bytes at most).
+    #[test]
+    fn process_name_is_ours() {
+        assert!(name_is_ours(b"fsearch", "fsearch"));
+        assert!(name_is_ours(b"fsearch-longer-n", "fsearch-longer-name"), "both truncate to 16 bytes");
+        assert!(name_is_ours(b"fsearch", "anything-else"), "the daemon's own name");
+        assert!(!name_is_ours(b"bash", "fsearch") && !name_is_ours(b"", "fsearch"));
+    }
 
     #[test]
     fn near() {
