@@ -3796,7 +3796,7 @@ fn lines_at(g: &Grep, buf: &[u8], found: impl Iterator<Item = (usize, usize)>) -
             counted = start;
             ls = memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1);
             le = memchr::memchr(b'\n', &buf[start..]).map_or(buf.len(), |p| start + p);
-            raw = &buf[ls..le.min(ls + 400)];
+            raw = &buf[ls..ls + cut(&buf[ls..le], 400)];
             let text = String::from_utf8_lossy(raw);
             utf8 = matches!(text, std::borrow::Cow::Borrowed(_));
             lines.push((line_no, text.trim_end().to_string()));
@@ -3852,7 +3852,20 @@ fn on_lines<'a>(re: &'a Regex, buf: &'a [u8]) -> impl Iterator<Item = (usize, us
 
 /// A line as shown: its first 400 bytes, trailing space trimmed.
 fn shown(line: &[u8]) -> String {
-    String::from_utf8_lossy(&line[..line.len().min(400)]).trim_end().to_string()
+    String::from_utf8_lossy(&line[..cut(line, 400)]).trim_end().to_string()
+}
+
+/// `max` bytes of `b`, backed off a UTF-8 character's start (at most 3
+/// bytes): a cut inside one would turn the whole line lossy.
+fn cut(b: &[u8], max: usize) -> usize {
+    let mut n = max.min(b.len());
+    for _ in 0..3 {
+        if b.get(n).is_none_or(|&c| c & 0xC0 != 0x80) {
+            break;
+        }
+        n -= 1;
+    }
+    n
 }
 
 /// Up to `n` lines before the line starting at `ls`, in order.
@@ -4842,5 +4855,19 @@ mod tests {
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// A shown line is cut at a character, not inside one.
+    #[test]
+    fn long_line_cut_at_char() {
+        let mut line = vec![b'a'; 399];
+        line.extend_from_slice("é".as_bytes());
+        line.extend_from_slice(b"bcdef");
+        let s = shown(&line);
+        assert_eq!(s.len(), 399);
+        assert!(!s.contains('\u{FFFD}'));
+        // At 4 the whole é is in; at 3 it would split, so back to its start.
+        assert_eq!((cut(b"ab\xC3\xA9x", 4), cut(b"ab\xC3\xA9x", 3), cut(b"ab\xF0\x9F\x98\x80x", 4)), (4, 2, 2));
+        assert_eq!(cut(b"abc", 400), 3);
     }
 }
