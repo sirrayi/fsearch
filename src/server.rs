@@ -381,7 +381,7 @@ impl Extras {
         };
         if let Some(o) = at {
             // Past what a page can be fetched from, every page is empty.
-            x.offset = (o.as_u64().or_else(|| o.as_str()?.parse().ok()).ok_or("offset must be a number")?).min(MAX_FETCH as u64) as usize;
+            x.offset = (count(o).or_else(|| o.as_str()?.parse().ok()).ok_or("offset must be a number")?).min(MAX_FETCH as u64) as usize;
         }
         let mut globs: Vec<&str> = match v.get("glob") {
             None => Vec::new(),
@@ -914,7 +914,7 @@ fn parse_request(v: &Value, home: &str) -> Result<(Query, Vec<(git::Sel, bool)>)
                 continue;
             }
             if k == "limit" {
-                q.limit = val.as_u64().ok_or("limit must be a number")? as usize;
+                q.limit = count(val).ok_or("limit must be a number")? as usize;
             } else {
                 let s = match val {
                     Value::String(s) => s.clone(),
@@ -925,6 +925,12 @@ fn parse_request(v: &Value, home: &str) -> Result<(Query, Vec<(git::Sel, bool)>)
         }
     }
     Ok((q, sels))
+}
+
+/// A JSON number as a count: a u64, or a finite non-negative whole f64
+/// (models send 20.0).
+fn count(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64))
 }
 
 /// A query's `git:` words (`git:modified`, `!git:ignored`), and the rest.
@@ -992,6 +998,13 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A count as a whole number, however the client wrote it.
+    #[test]
+    fn counts() {
+        assert_eq!((count(&json!(20)), count(&json!(20.0))), (Some(20), Some(20)));
+        assert_eq!((count(&json!(20.5)), count(&json!(-1)), count(&json!("20"))), (None, None, None));
+    }
 
     /// A pid is ours when proc_name shows our name (16 bytes at most).
     #[test]
