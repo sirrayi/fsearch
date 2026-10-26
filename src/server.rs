@@ -41,6 +41,20 @@ pub fn serve(dir: PathBuf, home: String) {
     };
     let g = git.clone();
     engine.on_change(move |dirs| g.changed(dirs));
+    // A stopped engine serves a frozen index: exit, so a launchd KeepAlive
+    // (or the next client, which starts a daemon on demand) restarts us.
+    {
+        let e = engine.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if let Some(m) = e.stopped() {
+                    eprintln!("{} engine stopped: {m}; exiting so the daemon restarts", fsearch::query::now_secs());
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
     let cx = Arc::new(Ctx { engine, git, frecency: Frecency::load(dir.join("frecency")) });
     let sock = socket_path(&dir);
     let _ = std::fs::remove_file(&sock);
