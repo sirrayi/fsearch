@@ -942,13 +942,47 @@ fn parts_match(parts: &[Part], names: &[&[u8]]) -> bool {
     }
 }
 
-/// `w` with its brace groups expanded: `*.{c,h}` is `*.c` and `*.h`.
+/// `w` with its brace groups expanded: `*.{c,h}` is `*.c` and `*.h`;
+/// nested groups expand too (`*.{rs,{c,h}}`).
 fn expand_braces(w: &str) -> Vec<String> {
     let Some(open) = w.find('{') else { return vec![w.to_string()] };
-    let Some(len) = w[open..].find('}') else { return vec![w.to_string()] };
-    let (head, body, tail) = (&w[..open], &w[open + 1..open + len], &w[open + len + 1..]);
+    // Its match: the '}' back at depth 0.
+    let mut depth = 0;
+    let close = w[open..].char_indices().find_map(|(i, c)| match c {
+        '{' => {
+            depth += 1;
+            None
+        }
+        '}' => {
+            depth -= 1;
+            (depth == 0).then_some(i)
+        }
+        _ => None,
+    });
+    let Some(close) = close else { return vec![w.to_string()] };
+    let (head, body, tail) = (&w[..open], &w[open + 1..open + close], &w[open + close + 1..]);
     let tails = expand_braces(tail);
-    body.split(',').flat_map(|b| tails.iter().map(move |t| format!("{head}{b}{t}"))).take(64).collect()
+    // Commas at the body's own depth only; an alternative may nest more.
+    split_top(body).into_iter().flat_map(expand_braces).flat_map(|b| tails.iter().map(move |t| format!("{head}{b}{t}"))).take(64).collect()
+}
+
+/// `body`'s comma-separated alternatives, ignoring commas in nested braces.
+fn split_top(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&body[start..]);
+    out
 }
 
 /// An `Alt` from one brace-free alternative.
@@ -4096,6 +4130,16 @@ mod tests {
     fn words_on_whitespace() {
         assert_eq!(split_words("a\tb\nc"), ["a", "b", "c"]);
         assert_eq!(split_words("\"a\tb\" c"), ["a\tb", "c"]);
+    }
+
+    /// Brace groups expand, nested ones too.
+    #[test]
+    fn braces() {
+        assert_eq!(expand_braces("a.{rs,{c,h}}"), ["a.rs", "a.c", "a.h"]);
+        assert_eq!(expand_braces("*.{c,h}"), ["*.c", "*.h"]);
+        assert_eq!(expand_braces("a.{x,{y,{p,q}}},z"), ["a.x,z", "a.y,z", "a.p,z", "a.q,z"]);
+        assert_eq!(expand_braces("no"), ["no"]);
+        assert_eq!(expand_braces("un{closed"), ["un{closed"]);
     }
 
     /// `lo..` and `..hi` are open-ended, `a..b` reversed is `b..a`.
