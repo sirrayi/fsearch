@@ -306,9 +306,12 @@ impl Git {
         paths.filter(|(p, _)| p.starts_with(dir) && p.get(dir.len()) == Some(&b'/')).collect()
     }
 
-    /// Repos already known at or under `dir`.
+    /// Repos already known at or under `dir` (a trailing '/' in `dir`
+    /// bounds by itself: / matches every root).
     pub fn known_under(&self, dir: &[u8]) -> Vec<Arc<Repo>> {
-        self.repos.lock().unwrap().iter().filter(|r| r.root.starts_with(dir) && r.root.get(dir.len()).is_none_or(|&b| b == b'/')).cloned().collect()
+        let under =
+            |r: &&Arc<Repo>| r.root.starts_with(dir) && (r.root.len() == dir.len() || dir.ends_with(b"/") || r.root.get(dir.len()) == Some(&b'/'));
+        self.repos.lock().unwrap().iter().filter(under).cloned().collect()
     }
 
     /// FSEvents saw these folders change (`Engine::on_change`; true: and
@@ -703,6 +706,15 @@ mod tests {
         assert_eq!(Sel::parse("m"), Some(Sel::Modified));
         assert_eq!(Sel::parse("c"), Some(Sel::Clean));
         assert!(Sel::Modified.test(Some(UNTRACKED)) && !Sel::Modified.test(Some(IGNORED)) && !Sel::Clean.test(None));
+    }
+
+    #[test]
+    fn known_at_or_under() {
+        let g = Git::new("/nonexistent");
+        let r = g.add(b"/p/repo");
+        let has = |dir: &[u8]| g.known_under(dir).iter().any(|o| Arc::ptr_eq(o, &r));
+        assert!(has(b"/") && has(b"/p") && has(b"/p/repo"));
+        assert!(!has(b"/p/re") && !has(b"/q"));
     }
 
     #[test]
