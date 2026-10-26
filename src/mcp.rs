@@ -1204,12 +1204,20 @@ fn clip(line: &str, pat: &str, max: usize) -> String {
     format!("{}{}{}", if start > 0 { "…" } else { "" }, &t[start..end], if end < t.len() { "…" } else { "" })
 }
 
-/// A file's text (for context lines), if it reads as text.
+/// A file's text (for context lines), if it reads as text, up to 8 MB.
 fn read_text(path: &str) -> String {
-    match std::fs::read(path) {
-        Ok(b) if b.len() <= 8 << 20 => String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
-        _ => String::new(),
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK keeps a FIFO from hanging open (and its read ends at once).
+    let mut f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
+        Ok(f) if f.metadata().is_ok_and(|m| m.is_file()) => f,
+        _ => return String::new(),
+    };
+    let mut b = Vec::new();
+    if (&mut f).take((8 << 20) + 1).read_to_end(&mut b).is_err() || b.len() > 8 << 20 {
+        return String::new();
     }
+    String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Is `path` `dir` or inside it?
