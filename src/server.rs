@@ -781,7 +781,8 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
     if let Some(ms) = v.get("budget_ms").and_then(Value::as_u64) {
         g.budget = (ms > 0).then(|| Duration::from_millis(ms));
     }
-    (g.before, g.after) = (num("before").or(num("context")).unwrap_or(0), num("after").or(num("context")).unwrap_or(0));
+    // Capped: with per_file 200 a huge context copies whole files per match.
+    (g.before, g.after) = (num("before").or(num("context")).unwrap_or(0).min(1000), num("after").or(num("context")).unwrap_or(0).min(1000));
     g.defs = v.get("defs").and_then(Value::as_bool).unwrap_or(false);
     g.skip = num("cursor").unwrap_or(0);
     let t = Instant::now();
