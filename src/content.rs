@@ -461,6 +461,14 @@ fn dead_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("seg-{id:06}.dead"))
 }
 
+/// The files of segments no manifest names anymore (see `drop_segments`).
+fn delete_files(dir: &Path, ids: &[u64]) {
+    for id in ids {
+        let _ = std::fs::remove_file(seg_path(dir, *id));
+        let _ = std::fs::remove_file(dead_path(dir, *id));
+    }
+}
+
 #[inline]
 fn varint(b: &[u8]) -> (u32, usize) {
     let mut v = 0u32;
@@ -2318,6 +2326,7 @@ impl Content {
             self.drop_segments(&empty);
             self.link();
             self.save_manifest();
+            delete_files(&self.dir, &empty);
         }
         todo.sort();
         if !todo.is_empty() {
@@ -2424,14 +2433,14 @@ impl Content {
         self.segs.insert(at, seg);
         self.link();
         self.save_manifest();
+        delete_files(&self.dir, ids);
     }
 
+    /// Out of `self.segs`. Their files go last (`delete_files`), once the
+    /// manifest no longer names them: a crash in between must not leave a
+    /// manifest naming deleted segments.
     fn drop_segments(&mut self, ids: &[u64]) {
         self.segs.retain(|s| !ids.contains(&s.id));
-        for id in ids {
-            let _ = std::fs::remove_file(seg_path(&self.dir, *id));
-            let _ = std::fs::remove_file(dead_path(&self.dir, *id));
-        }
     }
 
     /// Candidate docs for a pattern, filtered by the name query: in groups
