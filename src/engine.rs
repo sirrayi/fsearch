@@ -1126,14 +1126,16 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     })
                     .collect()
             };
+            // The write lock a folder at a time: a replay's batch of
+            // thousands would hold searches off for all of it at once.
+            for f in fetched {
+                if let Applied::Rebuild = shared.live.write().unwrap().as_mut().unwrap().apply(f) {
+                    rebuild = true;
+                }
+            }
             {
                 let mut g = shared.live.write().unwrap();
                 let live = g.as_mut().unwrap();
-                for f in fetched {
-                    if let Applied::Rebuild = live.apply(f) {
-                        rebuild = true;
-                    }
-                }
                 // With a gap, everything is applied only up to its start;
                 // with folders held back, only up to their first event.
                 live.event_id = match gap {

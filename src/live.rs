@@ -80,8 +80,9 @@ pub struct Live {
     pub names_cache: crate::query::NameCache,
     /// Wall-clock second up to which every change is known applied.
     pub synced_at: u32,
-    /// Overlay folder -> prior of its nearest base folder.
-    priors: HashMap<Vec<u8>, i8>,
+    /// Folder -> prior of its nearest base folder, and whether the base
+    /// holds the folder itself.
+    priors: HashMap<Vec<u8>, (i8, bool)>,
 }
 
 /// What `Live::fetch` read from disk for one folder update.
@@ -130,18 +131,38 @@ impl Live {
     fn put(&mut self, path: Vec<u8>, mut e: OEnt) {
         let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
         e.prior = match self.priors.get(&path[..cut]) {
-            Some(&p) => p,
+            Some(&(p, _)) => p,
             None => {
+                // The nearest folder up that the base holds sets the prior.
+                // A folder under one the base lacks isn't in it either, so a
+                // new subtree costs one failed lookup, not one per folder (each
+                // a scan of the nearest base folder's children: seconds under
+                // the write lock for a build's thousands of folders).
                 let mut up = &path[..cut];
+                let mut missed = Vec::new();
                 let mut prior = 0;
                 while !up.is_empty() {
-                    if let Some(d) = self.base.lookup(up).and_then(|e| self.base.dir_of(e)) {
-                        prior = self.base.dir_prior()[d as usize];
+                    if let Some(&(p, _)) = self.priors.get(up) {
+                        prior = p;
                         break;
                     }
-                    up = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                    let parent = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                    if let Some(&(p, false)) = self.priors.get(parent) {
+                        prior = p;
+                        missed.push(up);
+                        break;
+                    }
+                    if let Some(d) = self.base.lookup(up).and_then(|e| self.base.dir_of(e)) {
+                        prior = self.base.dir_prior()[d as usize];
+                        self.priors.insert(up.to_vec(), (prior, true));
+                        break;
+                    }
+                    missed.push(up);
+                    up = parent;
                 }
-                self.priors.insert(path[..cut].to_vec(), prior);
+                for m in missed {
+                    self.priors.insert(m.to_vec(), (prior, false));
+                }
                 prior
             }
         };
@@ -583,6 +604,29 @@ mod tests {
         assert_eq!(live.over.keys().filter(|k| k.starts_with(&root)).map(rel).collect::<Vec<_>>(), ["/swap"]);
         live.trees.sort();
         assert_eq!(live.trees.iter().map(rel).collect::<Vec<_>>(), ["/sub", "/swap"]);
+    }
+
+    /// A new subtree ranks with its nearest base folder's prior at every
+    /// depth, each folder's remembered.
+    #[test]
+    fn new_subtree_prior_at_every_depth() {
+        let d = std::env::temp_dir().join(format!("fsearch-prior-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let mut live = Live::new(base_for(&root));
+        std::fs::create_dir_all(d.join("a/b/c/d")).unwrap();
+        std::fs::write(d.join("a/b/c/d/f"), "x").unwrap();
+        live.apply_dir(&root, false);
+        let _ = std::fs::remove_dir_all(&d);
+        let want = live.base.dir_prior()[live.base.dir_of(live.base.lookup(&root).unwrap()).unwrap() as usize];
+        let under: Vec<_> = live.over.iter().filter(|(k, _)| k.starts_with(&root)).collect();
+        assert_eq!(under.len(), 5);
+        assert!(under.iter().all(|(_, o)| o.prior == want));
+        for (sub, in_base) in [("", true), ("/a", false), ("/a/b", false), ("/a/b/c", false), ("/a/b/c/d", false)] {
+            assert_eq!(live.priors.get(&[&root[..], sub.as_bytes()].concat()), Some(&(want, in_base)), "{sub}");
+        }
     }
 
     /// A recursive event on a mount point (/dev here) doesn't crawl the
